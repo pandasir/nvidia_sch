@@ -1,0 +1,150 @@
+// gpu-manager V1 RPC 接口契约 (proto3)。
+//
+// 本文件在 M0 里程碑先定稿接口;代码生成 (tonic-build / prost)
+// 在 M2 里程碑接入。命名与 DESIGN.md §11 一致。
+syntax = "proto3";
+
+package gpu.v1;
+
+// gRPC 服务通过 Unix Domain Socket 暴露,仅本机可访问(DESIGN.md §11)
+service GpuManager {
+  // 列出设备当前状态
+  rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse);
+  // 流式推送设备状态变更
+  rpc WatchDevices(WatchDevicesRequest) returns (stream DeviceStatus);
+
+  // 提交任务:资源充足则直接分配,否则入队
+  rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
+  rpc GetJob(GetJobRequest) returns (Job);
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+  // 取消排队中的任务;仅 root 与 job owner(ADR-1)
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+  // 强制终止运行中的任务;仅 root 与 job owner(ADR-1)
+  rpc KillJob(KillJobRequest) returns (KillJobResponse);
+  // 租约续期(v1 由 daemon 内部心跳;此处为 v2 用户自启进程模式预留)
+  rpc RenewLease(RenewLeaseRequest) returns (RenewLeaseResponse);
+
+  // 拉取当前指标快照(后续可由 /metrics 导出替代)
+  rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
+}
+
+// ---------- 资源模型 ----------
+
+enum DeviceState {
+  DEVICE_STATE_UNSPECIFIED = 0;
+  DEVICE_STATE_FREE = 1;
+  DEVICE_STATE_ALLOCATED = 2;
+  DEVICE_STATE_OFFLINE = 3;
+}
+
+enum JobStatus {
+  JOB_STATUS_UNSPECIFIED = 0;
+  JOB_STATUS_SUBMITTED = 1;
+  JOB_STATUS_QUEUED = 2;
+  JOB_STATUS_ALLOCATED = 3;
+  JOB_STATUS_RUNNING = 4;
+  JOB_STATUS_SUCCEEDED = 5;
+  JOB_STATUS_FAILED = 6;
+}
+
+enum FailureReason {
+  FAILURE_REASON_UNSPECIFIED = 0;
+  FAILURE_REASON_CANCELLED = 1;
+  FAILURE_REASON_QUEUE_TIMEOUT = 2;
+  FAILURE_REASON_KILLED = 3;
+  FAILURE_REASON_LEASE_EXPIRED = 4;
+  FAILURE_REASON_DEVICE_OFFLINE = 5;
+  FAILURE_REASON_EXITED_NONZERO = 6;
+  FAILURE_REASON_OTHER = 7;
+}
+
+message DeviceStatus {
+  string uuid = 1;
+  string name = 2;
+  string pci_bus_id = 3;
+  uint64 memory_total_mib = 4;
+  DeviceState state = 5;
+  // 运行期指标(M1 起填充)
+  uint64 utilization_percent = 6;
+  uint64 used_memory_mib = 7;
+  uint64 temperature_c = 8;
+}
+
+message Lease {
+  string id = 1;
+  string job_id = 2;
+  repeated string device_uuids = 3;
+  uint64 issued_at_ms = 4;
+  uint64 expires_at_ms = 5;
+}
+
+message Job {
+  string id = 1;
+  string owner = 2;
+  string description = 3;
+  uint32 gpus_requested = 4;
+  uint32 priority = 5;
+  JobStatus status = 6;
+  FailureReason failure_reason = 7;
+  uint64 submitted_at_ms = 8;
+  Lease lease = 9;
+}
+
+// ---------- RPC 消息 ----------
+
+message ListDevicesRequest {}
+message ListDevicesResponse {
+  repeated DeviceStatus devices = 1;
+}
+
+message WatchDevicesRequest {}
+
+message Submission {
+  string description = 1;
+  uint32 gpus_requested = 2;
+  uint32 priority = 3;
+  repeated string command = 4;
+  repeated string env = 5;
+  string workdir = 6;
+}
+
+message SubmitJobRequest {
+  Submission submission = 1;
+}
+message SubmitJobResponse {
+  string job_id = 1;
+  JobStatus status = 2; // 立即分配 → ALLOCATED;否则 QUEUED
+}
+
+message GetJobRequest {
+  string job_id = 1;
+}
+
+message ListJobsRequest {
+  string owner = 1; // 空 = 全部(root);非空 = 仅该 owner(权限过滤在服务端)
+}
+message ListJobsResponse {
+  repeated Job jobs = 1;
+}
+
+message CancelJobRequest {
+  string job_id = 1;
+}
+message CancelJobResponse {}
+
+message KillJobRequest {
+  string job_id = 1;
+}
+message KillJobResponse {}
+
+message RenewLeaseRequest {
+  string job_id = 1;
+}
+message RenewLeaseResponse {}
+
+message GetMetricsRequest {}
+message GetMetricsResponse {
+  repeated DeviceStatus devices = 1;
+  uint32 queued_jobs = 2;
+  uint32 running_jobs = 3;
+}

@@ -1,0 +1,15 @@
+[package]
+name = "gpu-api"
+description = "V1 gRPC 接口:proto 代码生成(tonic/prost)与接口契约"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[dependencies]
+prost.workspace = true
+tonic.workspace = true
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-build = "0.12"

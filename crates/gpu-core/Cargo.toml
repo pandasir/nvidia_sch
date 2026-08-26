@@ -1,0 +1,11 @@
+[package]
+name = "gpu-core"
+description = "GPU 调度核心:纯状态机与领域模型,零 I/O,可 mock 全量单测"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

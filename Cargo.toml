@@ -1,0 +1,33 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/gpu-api",
+    "crates/gpu-core",
+    "crates/nvmlx",
+    "crates/gpu-daemon",
+    "crates/gpu-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+gpu-api = { path = "crates/gpu-api" }
+gpu-core = { path = "crates/gpu-core" }
+hyper-util = { version = "0.1", features = ["tokio"] }
+nvmlx = { path = "crates/nvmlx" }
+prost = "0.13"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
+tokio-stream = { version = "0.1", features = ["sync", "net"] }
+tonic = "0.12"
+tower = { version = "0.4", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }

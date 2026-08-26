@@ -1,0 +1,20 @@
+[package]
+name = "gpu-cli"
+description = "GPU 资源调度命令行客户端"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "gpu"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+gpu-api.workspace = true
+hyper-util.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tower.workspace = true

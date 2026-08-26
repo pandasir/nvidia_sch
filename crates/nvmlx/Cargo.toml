@@ -1,0 +1,17 @@
+[package]
+name = "nvmlx"
+description = "GPU 设备访问抽象:DeviceProvider trait + NullProvider(无硬件开发后端) + NvmlProvider(真机)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["nvml"]
+
+# 真机 NVML 后端(基于 nvml-wrapper,运行时 dlopen 加载驱动库,
+# 无驱动环境下 NvmlProvider::new() 返回 Init 错误而非编译失败)
+nvml = ["dep:nvml-wrapper"]
+
+[dependencies]
+thiserror.workspace = true
+nvml-wrapper = { version = "0.12", optional = true }

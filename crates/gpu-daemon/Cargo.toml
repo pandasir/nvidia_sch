@@ -1,0 +1,29 @@
+[package]
+name = "gpu-daemon"
+description = "GPU 资源调度守护进程:设备发现、监控、gRPC API(M2 起接入调度闭环)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "gpu-daemon"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+gpu-api.workspace = true
+gpu-core.workspace = true
+nvmlx.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+futures-util.workspace = true
+hyper-util.workspace = true
+tower.workspace = true
