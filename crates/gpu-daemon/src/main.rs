@@ -47,6 +47,15 @@ struct Args {
     /// M4:重启恢复状态文件路径(JSON;默认关闭持久化,进程随 daemon 退出继续跑)
     #[arg(long)]
     state_file: Option<PathBuf>,
+
+    /// M5:每用户同时在飞(Allocated+Running)的最大卡数,0 = 不限(默认)。
+    /// 超配额的新请求入队等待,且不阻塞其他用户
+    #[arg(long, default_value_t = 0)]
+    max_gpus_per_user: u32,
+
+    /// M5:每用户非终态(排队+运行)作业数上限,超限提交即被拒绝,0 = 不限(默认)
+    #[arg(long, default_value_t = 0)]
+    max_concurrent_jobs_per_user: u32,
 }
 
 /// 默认 socket 路径:Linux 用 /run,其他平台(开发机)用 /tmp
@@ -103,6 +112,8 @@ async fn main() -> anyhow::Result<()> {
             CgroupArg::Noop => gpu_daemon::CgroupMode::Noop,
         },
         state_file: args.state_file,
+        max_gpus_per_user: args.max_gpus_per_user,
+        max_concurrent_jobs_per_user: args.max_concurrent_jobs_per_user,
     };
 
     gpu_daemon::run(cfg).await.context("daemon 运行失败")

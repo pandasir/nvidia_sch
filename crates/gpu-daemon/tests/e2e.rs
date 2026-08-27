@@ -27,6 +27,19 @@ async fn start_daemon_full(
     audit_log: Option<PathBuf>,
     state_file: Option<PathBuf>,
 ) -> (PathBuf, PathBuf, tokio::task::JoinHandle<anyhow::Result<()>>) {
+    start_daemon_full_quota(tag, fake_devices, audit_log, state_file, 0, 0).await
+}
+
+/// 带配额参数的统一启动器(M5)
+#[allow(clippy::too_many_arguments)]
+async fn start_daemon_full_quota(
+    tag: &str,
+    fake_devices: u32,
+    audit_log: Option<PathBuf>,
+    state_file: Option<PathBuf>,
+    max_gpus_per_user: u32,
+    max_concurrent_jobs_per_user: u32,
+) -> (PathBuf, PathBuf, tokio::task::JoinHandle<anyhow::Result<()>>) {
     let socket = tmp_socket(tag);
     let audit_path = match &audit_log {
         Some(p) => p.clone(),
@@ -42,6 +55,8 @@ async fn start_daemon_full(
         audit_log,
         cgroup_mode: gpu_daemon::CgroupMode::Noop,
         state_file,
+        max_gpus_per_user,
+        max_concurrent_jobs_per_user,
     };
     let handle = tokio::spawn(gpu_daemon::run(cfg));
     (socket, audit_path, handle)
@@ -570,20 +585,21 @@ async fn restart_collects_dead_job() {
     let (socket_a, _, handle_a) = start_daemon_full("m4-dead-a", 1, None, Some(state_file.clone())).await;
     let mut client_a = wait_connect(&socket_a).await;
 
-    let resp = submit(&mut client_a, 1, vec!["/bin/sleep".into(), "30".into()]).await;
+    let resp = submit(&mut client_a, 1, vec!["/bin/sleep".into(), "31".into()]).await;
     assert_eq!(resp.status, grpc::JobStatus::Running as i32);
     tokio::time::sleep(Duration::from_millis(500)).await; // 让状态文件落盘
 
     // 手动杀掉孤儿进程(模拟"daemon 宕机期间进程也死了")
+    // 用唯一个性化的 sleep 参数,避免与其他测试并行时的 pgrep 误伤
     let out = std::process::Command::new("pgrep")
-        .args(["-f", "sleep 30"])
+        .args(["-f", "sleep 31"])
         .output()
         .expect("pgrep 应可用");
     let pid = String::from_utf8_lossy(&out.stdout)
         .lines()
         .next()
         .map(|s| s.trim().to_string())
-        .expect("应能找到 sleep 30 进程");
+        .expect("应能找到 sleep 31 进程");
     std::process::Command::new("kill")
         .args(["-9", &pid])
         .status()
@@ -633,6 +649,119 @@ async fn restart_then_new_job_runs() {
     assert_eq!(resp2.status, grpc::JobStatus::Running as i32);
     let job = wait_terminal(&mut client_b, &resp2.job_id).await;
     assert_eq!(job.status, grpc::JobStatus::Succeeded as i32);
+
+    handle_b.abort();
+    let _ = std::fs::remove_file(socket_a);
+    let _ = std::fs::remove_file(socket_b);
+    let _ = std::fs::remove_file(&state_file);
+}
+
+// ---------- M5 公平与配额(§7.3) ----------
+
+/// 核心验收:每用户最大在飞卡数 —— 第 2 个作业排队等待,
+/// kill 第一个后自动运行(资源释放 → 配额空位 → 队列推进)
+#[tokio::test(flavor = "multi_thread")]
+async fn quota_gpus_second_job_waits_then_runs_after_kill() {
+    let (socket, _, handle) =
+        start_daemon_full_quota("q1", 1, None, None, 1, 0).await;
+    let mut client = wait_connect(&socket).await;
+
+    let a = submit(&mut client, 1, vec!["/bin/sleep".into(), "30".into()]).await;
+    assert_eq!(a.status, grpc::JobStatus::Running as i32);
+
+    // 同用户第 2 个作业:超"在飞卡数"配额 → 入队等待(不是拒绝,也不是立即运行)
+    let b = submit(&mut client, 1, vec!["/bin/sleep".into(), "3".into()]).await;
+    assert_eq!(
+        b.status,
+        grpc::JobStatus::Queued as i32,
+        "超配额作业应排队等待而非运行/拒绝"
+    );
+
+    // kill 第一个 → 配额空位 → b 自动分配并运行,短任务自然完成
+    client
+        .kill_job(grpc::KillJobRequest {
+            job_id: a.job_id.clone(),
+        })
+        .await
+        .unwrap();
+    wait_terminal(&mut client, &b.job_id).await;
+    assert_eq!(
+        client
+            .get_job(grpc::GetJobRequest {
+                job_id: b.job_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .status,
+        grpc::JobStatus::Succeeded as i32
+    );
+    wait_device_state(&mut client, "gpu-fake-00", grpc::DeviceState::Free as i32).await;
+
+    handle.abort();
+    let _ = std::fs::remove_file(socket);
+}
+
+/// 并发作业配额:第二提交直接拒绝(gRPC RESOURCE_EXHAUSTED)
+#[tokio::test(flavor = "multi_thread")]
+async fn quota_concurrent_jobs_rejects_oversubmission() {
+    let (socket, _, handle) =
+        start_daemon_full_quota("qc", 1, None, None, 0, 1).await;
+    let mut client = wait_connect(&socket).await;
+
+    let a = submit(&mut client, 1, vec!["/bin/sleep".into(), "30".into()]).await;
+    assert_eq!(a.status, grpc::JobStatus::Running as i32);
+
+    // 第 2 个并发作业:提交被配额拒绝
+    let err = client
+        .submit_job(grpc::SubmitJobRequest {
+            submission: Some(grpc::Submission {
+                description: "second".into(),
+                gpus_requested: 1,
+                priority: 5,
+                command: vec!["/bin/sleep".into(), "30".into()],
+                env: vec![],
+                workdir: "".into(),
+            }),
+        })
+        .await
+        .expect_err("并发作业数超限应提交失败")
+        .message()
+        .to_string();
+    assert!(
+        err.contains("配额"),
+        "错误应说明超配额,实际: {err}"
+    );
+    // 设备仍被第一个作业占用,无泄漏
+    wait_device_state(&mut client, "gpu-fake-00", grpc::DeviceState::Allocated as i32).await;
+
+    handle.abort();
+    let _ = std::fs::remove_file(socket);
+}
+
+/// 配额在重启后仍生效(配额随调度快照持久化)
+#[tokio::test(flavor = "multi_thread")]
+async fn quota_survives_restart() {
+    let state_file = tmp_socket("m5-state").with_extension("json");
+    let (socket_a, _, handle_a) =
+        start_daemon_full_quota("qa", 1, None, Some(state_file.clone()), 1, 0).await;
+    let mut client_a = wait_connect(&socket_a).await;
+    let a = submit(&mut client_a, 1, vec!["/bin/sleep".into(), "6".into()]).await;
+    assert_eq!(a.status, grpc::JobStatus::Running as i32);
+    tokio::time::sleep(Duration::from_millis(400)).await; // 状态文件落盘
+
+    handle_a.abort();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (socket_b, _, handle_b) =
+        start_daemon_full_quota("qb", 1, None, Some(state_file.clone()), 1, 0).await;
+    let mut client_b = wait_connect(&socket_b).await;
+    wait_terminal(&mut client_b, &a.job_id).await; // 恢复的作业跑到结束,配额空出
+    wait_device_state(&mut client_b, "gpu-fake-00", grpc::DeviceState::Free as i32).await;
+
+    // 新提交:配额恢复后正常运行
+    let b = submit(&mut client_b, 1, vec!["/bin/sleep".into(), "2".into()]).await;
+    assert_eq!(b.status, grpc::JobStatus::Running as i32);
 
     handle_b.abort();
     let _ = std::fs::remove_file(socket_a);

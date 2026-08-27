@@ -4,9 +4,9 @@
 
 > 完整设计文档见 [`DESIGN.md`](DESIGN.md):架构分层、租约模型、强制层(device cgroup)、监控故障、里程碑与 ADR 均已定稿。
 
-## 当前进度:M4 故障与恢复 ✅
+## 当前进度:M5 公平与配额 ✅
 
-- **gpu-core**(纯状态机,零 I/O):优先级队列、队首阻塞放置、租约 TTL + 心跳、排队超时、设备下线/恢复、Kill/取消、快照恢复 — 15 个单测
+- **gpu-core**(纯状态机,零 I/O):优先级队列、队首阻塞放置、租约 TTL + 心跳、排队超时、设备下线/恢复、Kill/取消、快照恢复、**M5 配额(在飞卡数 / 并发作业数)** — 22 个单测
 - **gpu-api**:`proto/gpu.proto` → tonic/prost 代码生成(vendored protoc,免安装)
 - **gpu-daemon**:
   - **enforcer**:进程启动(注入 `CUDA_VISIBLE_DEVICES` 软约束 + env/workdir 透传 + **setuid/setgid 降权**;pty 交互在 M3 之后)
@@ -19,11 +19,15 @@
     - **faults**:设备下线撤销租约 + 杀进程树(cgroup.kill + SIGKILL)+ cgroup 清理;双故障信号统一入口
     - **Xid 订阅**(仅 Linux):NVML `CRITICAL_XID_ERROR` 事件 → 立即触发设备下线(真机复核项)
     - **重启恢复**(`--state-file`):JSON 状态文件(原子写)每次状态变更落盘;重启后校验进程 pid 存活(Linux 排除僵尸)→ 恢复 Running 或按失败回收;**daemon 退出不杀子进程**
+  - **M5 — 公平与配额**(§7.3):
+    - `--max-gpus-per-user N`:每用户同时在飞(Allocated+Running)最大卡数;超配额的**新请求入队等待**,且**不阻塞其他用户**(配额门禁先于资源检查,只约束该用户自身)
+    - `--max-concurrent-jobs-per-user N`:非法态作业数上限,超限提交直接拒绝(gRPC `RESOURCE_EXHAUSTED`)
+    - 记账纯内存(leases/jobs 遍历),随调度快照持久化,**重启后配额继续生效**;旧状态文件缺配额字段自动按不限补齐
 - **gpu-cli**:`gpu run`(阻塞观察到终态)/ `gpu jobs` / `gpu queue` / `gpu kill` 可用
-- 14 个端到端集成测试:真实 UDS gRPC + NullProvider 模拟设备,覆盖提交运行/两进程抢 1 卡排队/杀进程释放/取消排队/命令不存在/审计轨迹/Killer 审计/**重启恢复(Running 恢复、死进程回收、恢复后新作业可运行**)
-- 真机行为验证(cgroup 硬墙无法在无卡环境验证):amd64 容器冒烟 — 非 root 用户(alice)提交的作业子进程真实降权为 uid=1000、alice 看不到 root 的作业、alice kill root 作业被拒(PermissionDenied)、容器内 `--cgroup-mode v2` 启动即失败;**M4 冒烟:提交 → 杀 daemon → 重启 → 作业恢复 Running → 自然结束自动回收 → 设备 Free → 新作业 SUCCEEDED**
+- 17 个端到端集成测试:真实 UDS gRPC + NullProvider 模拟设备,覆盖提交运行/两进程抢 1 卡排队/杀进程释放/取消排队/命令不存在/审计轨迹/Killer 审计/重启恢复(Running 恢复、死进程回收、恢复后新作业可运行)/**配额(超配额排队→kill 后自动运行、并发超限拒绝、配额重启后生效**)
+- 真机行为验证(cgroup 硬墙无法在无卡环境验证):amd64 容器冒烟 — 非 root 用户(alice)提交的作业子进程真实降权为 uid=1000、alice 看不到 root 的作业、alice kill root 作业被拒(PermissionDenied)、容器内 `--cgroup-mode v2` 启动即失败;M4 冒烟(提交→杀 daemon→重启→恢复 Running→自动回收→设备 Free);**M5 冒烟(同用户第 2 个作业排队、kill 后自动运行、并发超限被拒)**
 
-> 无卡环境可直接 `cargo test --workspace` 验证(53 个测试,含 macOS;Xid 链路为 Linux-only,真机复核)。
+> 无卡环境可直接 `cargo test --workspace` 验证(63 个测试,含 macOS;Xid 链路为 Linux-only,真机复核)。
 > 恢复的孤儿进程退出码不可考(daemon 重启后非其父进程),统一按"状态未知"回收为 Failed,资源正常释放。
 
 ## 构建与测试(无需 GPU)
@@ -57,9 +61,11 @@ cargo build --release --target x86_64-unknown-linux-gnu --workspace --bins
 ## 快速上手(无 GPU 机器演示)
 
 ```bash
-# 终端 1:启动 daemon(3 台模拟设备,2s 一轮指标刷新;建议同时开启审计与状态文件)
+# 终端 1:启动 daemon(3 台模拟设备;建议同时开启审计与状态文件以演示重启恢复)
+# M5 配额:--max-gpus-per-user 2 每人最多同时占 2 卡;--max-concurrent-jobs-per-user 3 每人最多 3 个作业
 cargo run -p gpu-daemon -- --provider null --fake-devices 3 --poll-interval-secs 2 \
-     --audit-log /tmp/gpu-audit.jsonl --cgroup-mode noop --state-file /tmp/gpu-state.json
+     --audit-log /tmp/gpu-audit.jsonl --cgroup-mode noop --state-file /tmp/gpu-state.json \
+     --max-gpus-per-user 2 --max-concurrent-jobs-per-user 3
 
 # 终端 2:查看设备实时状态
 cargo run -p gpu-cli -- ls
@@ -101,4 +107,4 @@ proto/              V1 gRPC 接口契约(vendored protoc 生成)
 | M2 整卡分配闭环(SubmitJob → 启动 → 退出回收) | ✅ |
 | M3 强制与安全(device cgroup、setuid、审计、Kill 权限;pty 延后) | ✅ |
 | M4 故障与恢复(Xid 订阅、设备下线、重启恢复) | ✅ |
-| M5 公平与配额 | ⏳ |
+| M5 公平与配额(多用户配额、公平份额、排队策略调优) | ✅ |

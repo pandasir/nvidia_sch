@@ -245,6 +245,8 @@ fn map_err(e: SchedulerError) -> Status {
         }
         SchedulerError::InvalidJobState { .. } => Status::failed_precondition(e.to_string()),
         SchedulerError::InvalidRequest(_) => Status::invalid_argument(e.to_string()),
+        // M5:提交配额(并发作业数)被拒 → gRPC RESOURCE_EXHAUSTED
+        SchedulerError::QuotaExceeded { .. } => Status::resource_exhausted(e.to_string()),
     }
 }
 

@@ -61,6 +61,11 @@ pub struct DaemonConfig {
     pub cgroup_mode: CgroupMode,
     /// M4:重启恢复状态文件(None = 关闭持久化)
     pub state_file: Option<PathBuf>,
+    /// M5 §7.3:每用户同时在飞(Allocated+Running)的最大卡数,0 = 不限。
+    /// 超配额的新请求入队等待,且不阻塞其他用户
+    pub max_gpus_per_user: u32,
+    /// M5 §7.3:每用户非终态作业数上限,超限提交直接拒绝,0 = 不限
+    pub max_concurrent_jobs_per_user: u32,
 }
 
 /// 设备发现后端种类
@@ -114,6 +119,8 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
 
     let mut scheduler = Scheduler::new(SchedulerConfig {
         queue_timeout_secs: cfg.queue_timeout_secs,
+        max_gpus_per_user: cfg.max_gpus_per_user,
+        max_concurrent_jobs_per_user: cfg.max_concurrent_jobs_per_user,
         ..Default::default()
     });
 

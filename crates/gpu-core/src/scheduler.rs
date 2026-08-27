@@ -21,11 +21,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 调度器配置
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)] // M5:旧版(M4 及更早)状态文件缺配额字段时以 Default(不限)补齐
 pub struct SchedulerConfig {
     /// 排队超时秒数,超时自动取消(0 = 不限制)。默认 1h(ADR-2)
     pub queue_timeout_secs: u64,
     /// 租约 TTL 秒数,心跳续期刷新。默认 12h
     pub lease_ttl_secs: u64,
+    /// M5 §7.3:每用户同时在飞(Allocated+Running)的最大卡数。0 = 不限。
+    /// 超配额的新请求**入队等待**,且不阻塞其他用户(配额仅约束该用户自身)。
+    pub max_gpus_per_user: u32,
+    /// M5 §7.3:每用户非终态作业数上限。超限提交**直接拒绝**
+    /// ([`SchedulerError::QuotaExceeded`])。0 = 不限。
+    pub max_concurrent_jobs_per_user: u32,
 }
 
 impl Default for SchedulerConfig {
@@ -33,6 +40,8 @@ impl Default for SchedulerConfig {
         Self {
             queue_timeout_secs: 3600,
             lease_ttl_secs: 12 * 3600,
+            max_gpus_per_user: 0,
+            max_concurrent_jobs_per_user: 0,
         }
     }
 }
@@ -241,6 +250,17 @@ impl Scheduler {
         }
         if req.owner.trim().is_empty() {
             return Err(SchedulerError::InvalidRequest("owner 不能为空".into()));
+        }
+
+        // M5 §7.3:并发作业数配额(0 = 不限)——超限提交直接拒绝
+        let max_concurrent = self.config.max_concurrent_jobs_per_user;
+        if max_concurrent > 0 && self.user_active_jobs(&req.owner) >= max_concurrent as usize {
+            return Err(SchedulerError::QuotaExceeded {
+                owner: req.owner.clone(),
+                detail: format!(
+                    "同时并发作业数已达上限 {max_concurrent}(含排队与运行)"
+                ),
+            });
         }
 
         let now = (self.now_ms)();
@@ -513,6 +533,8 @@ impl Scheduler {
     /// 队首阻塞式分配:只尝试队首;放不下则停止(严格优先级,防插队)
     fn try_allocate(&mut self, now: u64) -> Vec<SchedulerEvent> {
         let mut events = Vec::new();
+        // M5:因用户配额受限被跳过的作业,分配阶段结束后放回堆
+        let mut deferred: Vec<QueueEntry> = Vec::new();
         loop {
             let Some(peeked) = self.queue.peek() else {
                 break;
@@ -526,8 +548,18 @@ impl Scheduler {
                 self.queue.pop();
                 continue;
             }
+            // M5 配额门禁:**先于**资源检查——配额是 per-user 硬门禁,
+            // 不受全局资源余量影响(该用户本就不能再占)。
+            // 配额受限 → 不分配,但**不阻塞其他用户**(配额只约束该用户自身,
+            // 跳过继续看下一个;与低优先级插队无关)。
+            let quota = self.config.max_gpus_per_user;
+            if quota > 0 && self.user_inflight_gpus(&job.owner) + job.gpus_requested > quota {
+                let skipped = self.queue.pop().expect("peek 已确认非空");
+                deferred.push(skipped);
+                continue;
+            }
             if (self.free_count() as u32) < job.gpus_requested {
-                // 队首都放不下,后面的不插队
+                // 队首都放不下,后面的不插队(M2 队首阻塞语义)
                 break;
             }
             let entry = self.queue.pop().expect("peek 已确认非空");
@@ -563,7 +595,32 @@ impl Scheduler {
                 lease,
             });
         }
+        for d in deferred {
+            self.queue.push(d);
+        }
         events
+    }
+
+    /// M5:用户当前在飞(Allocated+Running)占用的卡数,按租约设备数计
+    fn user_inflight_gpus(&self, owner: &str) -> u32 {
+        self.leases
+            .values()
+            .filter(|l| {
+                self.jobs
+                    .get(&l.job_id)
+                    .map(|j| j.owner == owner)
+                    .unwrap_or(false)
+            })
+            .map(|l| l.device_uuids.len() as u32)
+            .sum()
+    }
+
+    /// M5:用户非终态作业数(提交并发配额检查用;含排队与运行)
+    fn user_active_jobs(&self, owner: &str) -> usize {
+        self.jobs
+            .values()
+            .filter(|j| j.owner == owner && !j.status.is_terminal())
+            .count()
     }
 
     /// 释放作业占用的全部设备并置终态。`failure = None` → `Succeeded`,
@@ -1005,5 +1062,149 @@ mod tests {
             vec!["gpu-0".to_string()]
         );
         assert_eq!(restored.free_count(), 0);
+    }
+
+    // ---------- M5 配额与公平(§7.3) ----------
+
+    fn quota_config(max_gpus: u32, max_concurrent: u32) -> SchedulerConfig {
+        SchedulerConfig {
+            max_gpus_per_user: max_gpus,
+            max_concurrent_jobs_per_user: max_concurrent,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn m5_max_concurrent_jobs_rejects_oversubmission() {
+        let mut s = Scheduler::new(quota_config(0, 1)); // 不限卡,但每用户最多 1 个作业
+        s.upsert_device(dev("gpu-0"));
+
+        let _a = submit(&mut s, "alice", 1, 5); // 占用配额
+        match s.submit(SubmitRequest {
+            owner: "alice".into(),
+            description: "second".into(),
+            gpus_requested: 1,
+            priority: 5,
+            queue_timeout_secs: None,
+        }) {
+            Err(SchedulerError::QuotaExceeded { owner, .. }) => assert_eq!(owner, "alice"),
+            other => panic!("第 2 个并发作业应被拒绝,实际: {other:?}"),
+        }
+        // 其他用户不受影响
+        let _b = submit(&mut s, "bob", 1, 5);
+        assert!(
+            s.queued_count() + s.leases.len() as usize >= 2,
+            "bob 不受 alice 配额影响"
+        );
+    }
+
+    #[test]
+    fn m5_max_concurrent_zero_means_unlimited() {
+        let mut s = Scheduler::new(quota_config(0, 0));
+        s.upsert_device(dev("gpu-0"));
+        let a = submit(&mut s, "alice", 1, 5);
+        let b = submit(&mut s, "alice", 1, 5);
+        assert!(a != b);
+        assert_eq!(s.queued_count(), 1, "第 2 个作业排队而非拒绝(并发不限)");
+    }
+
+    /// 核心验收:alice 超"在飞卡数"配额时**不阻塞** bob 拿到卡;
+    /// 而资源不足时仍保持队首阻塞(M2 语义)。
+    #[test]
+    fn m5_gpu_quota_skips_only_that_user_not_blocking_others() {
+        let mut s = Scheduler::new(quota_config(1, 0)); // 每人最多同时 1 卡
+        s.upsert_device(dev("gpu-0"));
+        s.upsert_device(dev("gpu-1"));
+
+        let alice_first = submit(&mut s, "alice", 1, 5); // 占 1 卡(已达配额)
+        assert_eq!(s.job(&alice_first).unwrap().status, JobStatus::Allocated);
+        assert_eq!(s.free_count(), 1);
+
+        let alice_second = submit(&mut s, "alice", 1, 5); // 超配额 → 入队等待
+        assert_eq!(s.job(&alice_second).unwrap().status, JobStatus::Queued);
+        assert_eq!(s.queued_count(), 1);
+
+        let bob = submit(&mut s, "bob", 1, 5); // bob 应跳过 alice 的配额作业拿到卡
+        assert_eq!(
+            s.job(&bob).unwrap().status,
+            JobStatus::Allocated,
+            "bob 不应被 alice 的配额等待阻塞"
+        );
+        assert_eq!(s.free_count(), 0, "剩余 1 卡应归 bob");
+        // alice 的第二个作业仍排队
+        assert_eq!(s.job(&alice_second).unwrap().status, JobStatus::Queued);
+    }
+
+    /// 配额释放后,等待中的作业自动分配(alice 一释放,b 立即拿到卡)
+    #[test]
+    fn m5_quota_waiter_allocated_after_user_frees_gpus() {
+        let mut s = Scheduler::new(quota_config(1, 0));
+        s.upsert_device(dev("gpu-0"));
+        s.upsert_device(dev("gpu-1"));
+
+        let alice_first = submit(&mut s, "alice", 1, 5);
+        let alice_second = submit(&mut s, "alice", 1, 5); // 排队
+        let _bob = submit(&mut s, "bob", 1, 5); // 拿第 2 卡
+        assert_eq!(s.free_count(), 0);
+
+        // alice 释放第一卡 → 配额空出一个 → alice_second 立即分配(先于后续作业)
+        s.finish(&alice_first, true, None).unwrap();
+        let events = s.tick(system_now_ms());
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SchedulerEvent::JobAllocated { .. })),
+            "释放后应触发分配"
+        );
+        assert_eq!(s.job(&alice_second).unwrap().status, JobStatus::Allocated);
+        assert_eq!(s.free_count(), 0, "释放的卡应给 alice_second,保持满载");
+    }
+
+    /// 多请求叠加同样受配额约束(alice 2 卡请求在配额 1 下也等待)
+    #[test]
+    fn m5_quota_counts_requested_gpus() {
+        let mut s = Scheduler::new(quota_config(1, 0));
+        s.upsert_device(dev("gpu-0"));
+        s.upsert_device(dev("gpu-1"));
+
+        let _a = submit(&mut s, "alice", 1, 5);
+        let b = submit(&mut s, "alice", 2, 5); // 2 卡 > 配额 1 → 即使有空卡也等待
+        assert_eq!(s.job(&b).unwrap().status, JobStatus::Queued);
+        assert_eq!(s.free_count(), 1, "配额 1 下 alice 不得再占卡");
+
+        // 资源不足时其他用户仍可拿(配额只挡 alice)
+        let c = submit(&mut s, "bob", 1, 5);
+        assert_eq!(s.job(&c).unwrap().status, JobStatus::Allocated);
+    }
+
+    /// M2 回归:无配额或配额充足时,资源不足保持队首阻塞
+    #[test]
+    fn m5_head_of_line_still_blocks_on_resources() {
+        let mut s = Scheduler::new(quota_config(0, 0));
+        s.upsert_device(dev("gpu-0"));
+
+        let _a = submit(&mut s, "u1", 1, 5); // 占唯一卡
+        let big = submit(&mut s, "u2", 2, 5); // 队首:2 卡(放不下)
+        let small = submit(&mut s, "u3", 1, 5); // 队尾:1 卡(能放下,但不插队)
+        assert_eq!(s.job(&small).unwrap().status, JobStatus::Queued);
+
+        s.finish(&_a, true, None).unwrap();
+        s.tick(system_now_ms());
+        // 队首 big 放不下(只剩 1 卡)→ 整队阻塞,small 不插队
+        assert_eq!(s.job(&big).unwrap().status, JobStatus::Queued);
+        assert_eq!(s.job(&small).unwrap().status, JobStatus::Queued);
+        assert_eq!(s.free_count(), 1);
+    }
+
+    /// 快照序列化兼容:旧配置(无配额字段)读入后配额为 0(不限)
+    #[test]
+    fn m5_snapshot_missing_quota_fields_defaults_to_unlimited() {
+        let old_json = r#"{
+            "queue_timeout_secs": 3600,
+            "lease_ttl_secs": 43200
+        }"#;
+        let cfg: SchedulerConfig = serde_json::from_str(old_json).unwrap();
+        assert_eq!(cfg.max_gpus_per_user, 0, "旧快照应缺省为不限");
+        assert_eq!(cfg.max_concurrent_jobs_per_user, 0);
     }
 }

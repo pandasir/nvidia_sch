@@ -15,4 +15,8 @@ pub enum SchedulerError {
 
     #[error("请求不合法: {0}")]
     InvalidRequest(String),
+
+    /// M5:提交配额(并发作业数)被拒;运行期配额(在飞卡数)则入队等待,不报错
+    #[error("用户 {owner} 超出配额: {detail}")]
+    QuotaExceeded { owner: String, detail: String },
 }
