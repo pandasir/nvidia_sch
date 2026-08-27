@@ -2,3 +2,5 @@
 /mobile/build
 .idea/
 .DS_Store
+/.tools
+dist

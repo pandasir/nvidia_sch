@@ -37,6 +37,10 @@ impl DeviceProvider for NullProvider {
         Ok(self.devices.clone())
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn poll(&self) -> Result<Vec<DeviceMetrics>, ProviderError> {
         let tick = self.tick.fetch_add(1, Ordering::Relaxed);
         Ok(self
@@ -73,6 +77,7 @@ mod tests {
             name: "Fake GPU".into(),
             pci_bus_id: "0000:00:00.0".into(),
             memory_total_mib: 16384,
+            unix_minor: None,
         }
     }
 

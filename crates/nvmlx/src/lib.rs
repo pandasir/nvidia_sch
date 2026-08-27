@@ -13,4 +13,6 @@ pub mod traits;
 pub use null::NullProvider;
 #[cfg(feature = "nvml")]
 pub use nvml::NvmlProvider;
+#[cfg(all(feature = "nvml", target_os = "linux"))]
+pub use nvml::{XidNotification, XidWatcher};
 pub use traits::{DeviceMetrics, DeviceProvider, DeviceSnapshot, ProviderError};

@@ -1,7 +1,7 @@
 // gpu-manager V1 RPC 接口契约 (proto3)。
 //
-// 本文件在 M0 里程碑先定稿接口;代码生成 (tonic-build / prost)
-// 在 M2 里程碑接入。命名与 DESIGN.md §11 一致。
+// 本文件在 M0 里程碑定稿接口;代码生成 (tonic-build / prost) 在 M1
+// 接入(vendored protoc)。命名与 DESIGN.md §11 一致。
 syntax = "proto3";
 
 package gpu.v1;
@@ -113,7 +113,8 @@ message SubmitJobRequest {
 }
 message SubmitJobResponse {
   string job_id = 1;
-  JobStatus status = 2; // 立即分配 → ALLOCATED;否则 QUEUED
+  // 提交后的即时状态:资源充足且已拉起进程 → RUNNING;否则 QUEUED
+  JobStatus status = 2;
 }
 
 message GetJobRequest {

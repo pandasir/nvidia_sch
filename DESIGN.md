@@ -220,7 +220,9 @@ Lease {
 ## 10. 存储与恢复
 
 - 双轨：
-  - **Lease 快照**：每次状态变更写一份（`redb` 或 `rusqlite`，单文件嵌入式），daemon 启动时加载。
+  - **Lease 快照**：每次状态变更写一份（`redb` 或 `rusqlite`，单文件嵌入式，daemon 启动时加载。
+    > M4 落地为 **JSON + 原子 rename**(`--state-file`，tmp 写 + rename，含 scheduler 快照/进程 pid/owner 记账)。
+    > 轻依赖的务实偏差：单机状态量小(无 ACID 并发需求)，JSON 可读可审计；文件损坏拒绝启动而非静默丢状态。
   - **审计事件日志**：append-only 文本（JSON Lines），`{ts, event, user, lease, devices, detail}`，用于审计/记账/复盘。
 - 恢复流程（见 §6）：先加载快照，再逐个校验进程存活，得到"恢复 vs 回收"判定，写恢复事件。
 - 事件日志即"事实来源"（source of truth），快照是加速恢复的缓存——两者顺序写入要保证一致性（先落日志，再更新快照）。
@@ -298,9 +300,34 @@ gpu-manager/                 (workspace)
 > 提前到 M1 落地,当前仅实现只读 RPC(ListDevices/WatchDevices/GetMetrics);
 > 作业类 RPC 在 M2 接入。protoc 解析优先 vendored 预编译二进制,免安装 protoc。
 | **M1 设备发现与监控** | NVML 枚举、轮询、/metrics | `gpu ls` 显示真实设备与实时状态 |
-| **M2 整卡分配闭环** | 状态机、队列、SubmitJob→启动→退出回收 | 两进程抢 1 张卡：一个跑完另一个才跑；kill 后卡立即释放 |
-| **M3 强制与安全** | device cgroup、setuid、pty 交互直通、进程树回收、审计日志、Kill 权限 | 无卡测试环境用手写假 cgroup 验证；真机验证绕不过 cgroup |
+| **M2 整卡分配闭环** | 状态机、队列、SubmitJob→启动→退出回收 | 两进程抢 1 张卡：一个跑完另一个才跑；kill 后卡立即释放 | ✅ 2026-08-26 完成 |
+
+> M2 备注：作业类 RPC(SubmitJob/GetJob/ListJobs/CancelJob/KillJob)与 CLI
+> (`gpu run`/`jobs`/`queue`/`kill`)已接入。M2 的"强制"仅含软约束
+> (`CUDA_VISIBLE_DEVICES` 注入)；device cgroup 硬墙、setuid 降权、pty、
+> 审计日志与 Kill 权限(root/SO_PEERCRED)属 M3。M2 按 daemon 运行用户
+> 记账 owner,身份识别待 M3 接入。daemon 退出不杀子进程,为 M4 重启恢复预留。
+| **M3 强制与安全** | device cgroup、setuid、pty 交互直通、进程树回收、审计日志、Kill 权限 | 无卡测试环境用手写假 cgroup 验证；真机验证绕不过 cgroup | ✅ 2026-08-26 完成 |
+
+> M3 备注：身份/权限——owner 改自 UDS 对端凭证(SO_PEERCRED/getpeereid,
+> tonic `UdsConnectInfo.peer_cred` 内置)，客户端不可伪造；Kill/Cancel 仅
+> root 与 job owner(ADR-1)；普通用户 jobs 只见自己的作业。
+> 强制层——device cgroup v2：手写 eBPF(`BPF_PROG_TYPE_CGROUP_DEVICE`)
+> 按 (major,minor) 白名单放行(含 nvidiactl/nvidia-uvm/基础设备)，`cgroup.kill`
+> 杀整棵进程树；`--cgroup-mode v2` 探测失败启动即退(fail-fast)，`auto`
+> 降级 noop 仅告警；daemon 为 root 时子进程 setuid/setgid 降到请求者。
+> 审计——JSONL append-only(`--audit-log`)，记录提交/排队/分配/运行/结束/
+> Kill/失败及 user/uid/设备。pty 交互直通未随 M3 落地(proto 无 I/O 流)，延后。
+> 验收：无卡容器(amd64)实测 alice 作业子进程 uid=1000、alice kill root
+> 作业被拒、v2 模式下无 cgroup 直接失败；真机 cgroup 硬墙仍需真机复核。
 | **M4 故障与恢复** | Xid 订阅、设备下线、重启恢复 | 杀进程 → 自动回收；重启 daemon → 状态正确恢复 |
+> M4 已落地：**monitor 设备清单对账**(列表消失连续 2 轮 → 下线，防抖；新卡热插拔注册；消失卡复现 → 恢复上线)；
+> **faults**：设备下线撤销租约 + 杀整棵进程树(cgroup.kill + SIGKILL) + cgroup 清理，双信号(Xid 事件 / 清单消失)统一入口；
+> **Xid 订阅**(仅 Linux，nvml-wrapper EventSet，CRITICAL_XID_ERROR → 立即下线)；
+> **重启恢复**(`--state-file`)：恢复进程校验 pid 存活(Linux 排除僵尸)→ 恢复 Running 或按失败回收，
+> 恢复的孤儿进程退出码不可考(非其父进程,无法 wait)按"状态未知"回收为 Failed；daemon 退出不杀子进程。
+> 验收：amd64 容器实测提交 → 杀 daemon → 重启 → 作业恢复 Running → 自然结束自动回收 → 设备 Free → 新作业可运行；
+> 外部 SIGKILL 子进程 → reaper 自动回收并推进队列(单测/单元覆盖)；Xid 链路需真机复核(无卡环境不激活)。
 | **M5 公平与配额** | 多用户配额、公平份额、排队策略调优 | 配额测试用例通过 |
 
 ## 16. 设计决策记录（ADR）

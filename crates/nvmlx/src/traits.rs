@@ -7,6 +7,10 @@ pub struct DeviceSnapshot {
     pub name: String,
     pub pci_bus_id: String,
     pub memory_total_mib: u64,
+    /// Linux 设备文件次设备号(即 /dev/nvidia<N> 的 N,真机自 NVML
+    /// `minor_number` 获取);用于 cgroup 设备过滤白名单(M3)。
+    /// 无卡后端(mock)为 None。
+    pub unix_minor: Option<u32>,
 }
 
 /// 设备实时指标(监控轮询输出)
@@ -34,6 +38,8 @@ pub enum ProviderError {
     Unavailable(String),
     #[error("io 错误: {0}")]
     Io(#[from] std::io::Error),
+    #[error("xid 事件监听失败: {0}")]
+    Xid(String),
 }
 
 /// 设备发现与监控后端
@@ -45,4 +51,8 @@ pub trait DeviceProvider: Send + Sync {
     fn poll(&self) -> Result<Vec<DeviceMetrics>, ProviderError> {
         Ok(Vec::new())
     }
+
+    /// 类型擦除访问(M4:daemon 需要 downcast 到具体 provider
+    /// 以启用后端特有能力,如 Xid 事件监听)
+    fn as_any(&self) -> &dyn std::any::Any;
 }

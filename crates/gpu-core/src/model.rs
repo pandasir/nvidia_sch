@@ -48,6 +48,13 @@ pub enum JobStatus {
     Failed,
 }
 
+impl JobStatus {
+    /// 是否终态(此后不再参与调度,设备已释放)
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, JobStatus::Succeeded | JobStatus::Failed)
+    }
+}
+
 /// 失败原因(终态为 `Failed` 时的细节)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailureReason {
@@ -61,6 +68,8 @@ pub enum FailureReason {
     LeaseExpired,
     /// 所在设备故障下线
     DeviceOffline,
+    /// 进程已退出但退出码非零(含 exec 失败,如命令不存在)
+    ExitedNonzero,
     /// 其他原因
     Other(String),
 }

@@ -35,6 +35,18 @@ struct Args {
     /// null provider 的模拟设备数量(仅 --provider null 生效,0 = 空)
     #[arg(long, default_value_t = 0)]
     fake_devices: u32,
+
+    /// M3:JSONL 审计日志路径(默认关闭;建议生产环境启用)
+    #[arg(long)]
+    audit_log: Option<PathBuf>,
+
+    /// M3:强制层模式(auto 探测 / v2 强制 fail-fast / noop 关闭)
+    #[arg(long, value_enum, default_value_t = CgroupArg::Auto)]
+    cgroup_mode: CgroupArg,
+
+    /// M4:重启恢复状态文件路径(JSON;默认关闭持久化,进程随 daemon 退出继续跑)
+    #[arg(long)]
+    state_file: Option<PathBuf>,
 }
 
 /// 默认 socket 路径:Linux 用 /run,其他平台(开发机)用 /tmp
@@ -52,6 +64,16 @@ enum ProviderArg {
     Null,
     /// NVML 真机后端(需要 NVIDIA 驱动)
     Nvml,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CgroupArg {
+    /// 自动探测 cgroup v2,不可用则降级 noop(--cgroup-mode auto 默认)
+    Auto,
+    /// 强制 v2 隔离,探测失败直接退出(fail-fast)
+    V2,
+    /// 关闭隔离(测试/开发)
+    Noop,
 }
 
 #[tokio::main]
@@ -74,6 +96,13 @@ async fn main() -> anyhow::Result<()> {
         metrics_port: args.metrics_port,
         queue_timeout_secs: args.queue_timeout_secs,
         fake_devices: args.fake_devices,
+        audit_log: args.audit_log,
+        cgroup_mode: match args.cgroup_mode {
+            CgroupArg::Auto => gpu_daemon::CgroupMode::Auto,
+            CgroupArg::V2 => gpu_daemon::CgroupMode::V2,
+            CgroupArg::Noop => gpu_daemon::CgroupMode::Noop,
+        },
+        state_file: args.state_file,
     };
 
     gpu_daemon::run(cfg).await.context("daemon 运行失败")

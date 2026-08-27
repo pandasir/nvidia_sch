@@ -1,7 +1,8 @@
 //! gRPC 服务:实现 `gpu.v1.GpuManager`。
 //!
-//! M1 里程碑实现只读路径:`ListDevices` / `WatchDevices` / `GetMetrics`;
-//! 作业相关 RPC(M2:SubmitJob/KillJob/...) 返回 unimplemented。
+//! M1 实现只读路径(`ListDevices` / `WatchDevices` / `GetMetrics`);
+//! M2 接入作业闭环:SubmitJob / GetJob / ListJobs / CancelJob / KillJob
+//! (RenewLease 仍为 v2 预留)。
 
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -11,12 +12,18 @@ use anyhow::Context;
 use futures_util::{Stream, StreamExt};
 use gpu_api::grpc;
 use gpu_api::grpc::gpu_manager_server::{GpuManager, GpuManagerServer};
+use gpu_core::model::{FailureReason, Job, JobStatus};
+use gpu_core::scheduler::SubmitRequest;
+use gpu_core::SchedulerError;
 use tokio::net::UnixListener;
 use tokio::sync::watch;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 use tracing::info;
 
+use crate::enforcer::{RunAs, SpawnSpec};
+use crate::identity::{caller_from_request, Caller};
+use crate::jobs;
 use crate::state::AppState;
 
 type WatchStream = Pin<Box<dyn Stream<Item = Result<grpc::DeviceStatus, Status>> + Send + 'static>>;
@@ -105,41 +112,120 @@ impl GpuManager for GpuSvc {
         }))
     }
 
-    // ---------- 以下为 M2 才接入的作业类 RPC ----------
+    // ---------- M2:作业闭环 ----------
 
     async fn submit_job(
         &self,
-        _request: Request<grpc::SubmitJobRequest>,
+        request: Request<grpc::SubmitJobRequest>,
     ) -> Result<Response<grpc::SubmitJobResponse>, Status> {
-        Err(Status::unimplemented("SubmitJob 在 M2 里程碑接入"))
+        // 身份来自 UDS 对端凭证(SO_PEERCRED/getpeereid),不可伪造(DESIGN §13)
+        let caller = caller_from_request(&request);
+        let sub = request
+            .into_inner()
+            .submission
+            .ok_or_else(|| Status::invalid_argument("缺少 submission"))?;
+        if sub.command.is_empty() {
+            return Err(Status::invalid_argument("command 不能为空"));
+        }
+        if sub.gpus_requested == 0 {
+            return Err(Status::invalid_argument("gpus_requested 必须 >= 1"));
+        }
+        if sub.priority > u8::MAX as u32 {
+            return Err(Status::invalid_argument("priority 超出范围 (0-255)"));
+        }
+
+        let spec = SpawnSpec {
+            command: sub.command,
+            env: parse_env(&sub.env).map_err(Status::invalid_argument)?,
+            workdir: if sub.workdir.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(sub.workdir))
+            },
+            // M3 降权:子进程以调用者身份运行(daemon 为 root 时才真正生效)
+            run_as: Some(RunAs {
+                uid: caller.uid,
+                gid: caller.gid,
+            }),
+        };
+        let req = SubmitRequest {
+            owner: caller.username.clone(),
+            description: sub.description,
+            gpus_requested: sub.gpus_requested,
+            priority: sub.priority as u8,
+            queue_timeout_secs: None,
+        };
+
+        let (job_id, status) = jobs::submit_job(&self.state, req, spec, caller.uid).map_err(map_err)?;
+        info!("SubmitJob job={job_id} status={status:?} caller={} (uid={})", caller.username, caller.uid);
+        Ok(Response::new(grpc::SubmitJobResponse {
+            job_id,
+            status: to_grpc_status(status),
+        }))
     }
 
     async fn get_job(
         &self,
-        _request: Request<grpc::GetJobRequest>,
+        request: Request<grpc::GetJobRequest>,
     ) -> Result<Response<grpc::Job>, Status> {
-        Err(Status::unimplemented("GetJob 在 M2 里程碑接入"))
+        let caller = caller_from_request(&request);
+        let job_id = request.into_inner().job_id;
+        let sched = self.state.scheduler.lock().expect("scheduler 锁");
+        let job = sched
+            .job(&job_id)
+            .ok_or_else(|| Status::not_found(format!("job {job_id} 不存在")))?;
+        // 可见性: 仅 root 与 job owner(ADR-1)
+        caller.authorize_job(&job.owner).map_err(permission_denied)?;
+        Ok(Response::new(to_grpc_job(job, sched.lease(&job_id))))
     }
 
     async fn list_jobs(
         &self,
-        _request: Request<grpc::ListJobsRequest>,
+        request: Request<grpc::ListJobsRequest>,
     ) -> Result<Response<grpc::ListJobsResponse>, Status> {
-        Err(Status::unimplemented("ListJobs 在 M2 里程碑接入"))
+        let caller = caller_from_request(&request);
+        let requested = request.into_inner().owner;
+        let sched = self.state.scheduler.lock().expect("scheduler 锁");
+        let mut jobs: Vec<grpc::Job> = sched
+            .jobs()
+            .filter(|j| {
+                if caller.is_root() {
+                    // root: 全量或按请求过滤
+                    requested.is_empty() || j.owner == requested
+                } else {
+                    // 普通用户: 强制只看自己的作业
+                    j.owner == caller.username
+                }
+            })
+            .map(|j| to_grpc_job(j, sched.lease(&j.id)))
+            .collect();
+        // 稳定排序:先提交的先展示
+        jobs.sort_by_key(|j| (j.submitted_at_ms, j.id.clone()));
+        Ok(Response::new(grpc::ListJobsResponse { jobs }))
     }
 
     async fn cancel_job(
         &self,
-        _request: Request<grpc::CancelJobRequest>,
+        request: Request<grpc::CancelJobRequest>,
     ) -> Result<Response<grpc::CancelJobResponse>, Status> {
-        Err(Status::unimplemented("CancelJob 在 M2 里程碑接入"))
+        let caller = caller_from_request(&request);
+        let job_id = request.into_inner().job_id;
+        authorize_owner(&self.state, &caller, &job_id)?;
+        jobs::cancel_job(&self.state, &job_id).map_err(map_err)?;
+        info!("CancelJob job={job_id} caller={}", caller.username);
+        Ok(Response::new(grpc::CancelJobResponse {}))
     }
 
     async fn kill_job(
         &self,
-        _request: Request<grpc::KillJobRequest>,
+        request: Request<grpc::KillJobRequest>,
     ) -> Result<Response<grpc::KillJobResponse>, Status> {
-        Err(Status::unimplemented("KillJob 在 M2 里程碑接入"))
+        let caller = caller_from_request(&request);
+        let job_id = request.into_inner().job_id;
+        authorize_owner(&self.state, &caller, &job_id)?;
+        jobs::kill_job(&self.state, &job_id).map_err(map_err)?;
+        info!("KillJob job={job_id} caller={}", caller.username);
+        Ok(Response::new(grpc::KillJobResponse {}))
     }
 
     async fn renew_lease(
@@ -147,5 +233,99 @@ impl GpuManager for GpuSvc {
         _request: Request<grpc::RenewLeaseRequest>,
     ) -> Result<Response<grpc::RenewLeaseResponse>, Status> {
         Err(Status::unimplemented("RenewLease 为 v2 预留"))
+    }
+}
+
+// ---------- 映射辅助 ----------
+
+fn map_err(e: SchedulerError) -> Status {
+    match e {
+        SchedulerError::JobNotFound { .. } | SchedulerError::DeviceNotFound { .. } => {
+            Status::not_found(e.to_string())
+        }
+        SchedulerError::InvalidJobState { .. } => Status::failed_precondition(e.to_string()),
+        SchedulerError::InvalidRequest(_) => Status::invalid_argument(e.to_string()),
+    }
+}
+
+fn permission_denied(msg: String) -> Status {
+    Status::permission_denied(msg)
+}
+
+/// ADR-1:敏感操作(取消/Kill)仅 root 与 job owner 可执行
+///
+/// 返回 `Status` 以保留"不存在(404) vs 无权限(403)"语义;
+/// 大 Err 类型为既有惯例(见 parse_env 注释),此处需要 Status 细粒度。
+#[allow(clippy::result_large_err)]
+fn authorize_owner(state: &AppState, caller: &Caller, job_id: &str) -> Result<(), Status> {
+    let owner = {
+        let sched = state.scheduler.lock().expect("scheduler 锁");
+        sched
+            .job(job_id)
+            .map(|j| j.owner.clone())
+            .ok_or_else(|| Status::not_found(format!("job {job_id} 不存在")))?
+    };
+    caller.authorize_job(&owner).map_err(permission_denied)
+}
+
+/// 解析 `KEY=VALUE` 环境变量列表;非法格式返回错误描述(调用方转 Status)
+fn parse_env(env: &[String]) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::with_capacity(env.len());
+    for kv in env {
+        let Some((k, v)) = kv.split_once('=') else {
+            return Err(format!("env 需为 KEY=VALUE 格式,实际: {kv:?}"));
+        };
+        if k.is_empty() {
+            return Err(format!("env 键不能为空: {kv:?}"));
+        }
+        out.push((k.to_string(), v.to_string()));
+    }
+    Ok(out)
+}
+
+fn to_grpc_status(s: JobStatus) -> i32 {
+    match s {
+        JobStatus::Submitted => grpc::JobStatus::Submitted as i32,
+        JobStatus::Queued => grpc::JobStatus::Queued as i32,
+        JobStatus::Allocated => grpc::JobStatus::Allocated as i32,
+        JobStatus::Running => grpc::JobStatus::Running as i32,
+        JobStatus::Succeeded => grpc::JobStatus::Succeeded as i32,
+        JobStatus::Failed => grpc::JobStatus::Failed as i32,
+    }
+}
+
+fn to_grpc_failure(f: &FailureReason) -> i32 {
+    match f {
+        FailureReason::Cancelled => grpc::FailureReason::Cancelled as i32,
+        FailureReason::QueueTimeout => grpc::FailureReason::QueueTimeout as i32,
+        FailureReason::Killed => grpc::FailureReason::Killed as i32,
+        FailureReason::LeaseExpired => grpc::FailureReason::LeaseExpired as i32,
+        FailureReason::DeviceOffline => grpc::FailureReason::DeviceOffline as i32,
+        FailureReason::ExitedNonzero => grpc::FailureReason::ExitedNonzero as i32,
+        FailureReason::Other(_) => grpc::FailureReason::Other as i32,
+    }
+}
+
+fn to_grpc_job(job: &Job, lease: Option<&gpu_core::model::Lease>) -> grpc::Job {
+    grpc::Job {
+        id: job.id.clone(),
+        owner: job.owner.clone(),
+        description: job.description.clone(),
+        gpus_requested: job.gpus_requested,
+        priority: job.priority as u32,
+        status: to_grpc_status(job.status),
+        failure_reason: job
+            .failure
+            .as_ref()
+            .map(to_grpc_failure)
+            .unwrap_or(grpc::FailureReason::Unspecified as i32),
+        submitted_at_ms: job.submitted_at_ms,
+        lease: lease.map(|l| grpc::Lease {
+            id: l.id.clone(),
+            job_id: l.job_id.clone(),
+            device_uuids: l.device_uuids.clone(),
+            issued_at_ms: l.issued_at_ms,
+            expires_at_ms: l.expires_at_ms,
+        }),
     }
 }
