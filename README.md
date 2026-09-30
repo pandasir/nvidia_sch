@@ -21,7 +21,7 @@
     - **重启恢复**(`--state-file`):JSON 状态文件(原子写)每次状态变更落盘;重启后校验进程 pid 存活(Linux 排除僵尸)→ 恢复 Running 或按失败回收;**daemon 退出不杀子进程**
   - **M5 — 公平与配额**(§7.3):
     - `--max-gpus-per-user N`:每用户同时在飞(Allocated+Running)最大卡数;超配额的**新请求入队等待**,且**不阻塞其他用户**(配额门禁先于资源检查,只约束该用户自身)
-    - `--max-concurrent-jobs-per-user N`:非法态作业数上限,超限提交直接拒绝(gRPC `RESOURCE_EXHAUSTED`)
+    - `--max-concurrent-jobs-per-user N`:非终态(排队+运行)作业数上限,超限提交直接拒绝(gRPC `RESOURCE_EXHAUSTED`)
     - 记账纯内存(leases/jobs 遍历),随调度快照持久化,**重启后配额继续生效**;旧状态文件缺配额字段自动按不限补齐
 - **gpu-cli**:`gpu run`(阻塞观察到终态)/ `gpu jobs` / `gpu queue` / `gpu kill` 可用
 - 17 个端到端集成测试:真实 UDS gRPC + NullProvider 模拟设备,覆盖提交运行/两进程抢 1 卡排队/杀进程释放/取消排队/命令不存在/审计轨迹/Killer 审计/重启恢复(Running 恢复、死进程回收、恢复后新作业可运行)/**配额(超配额排队→kill 后自动运行、并发超限拒绝、配额重启后生效**)
@@ -92,19 +92,25 @@ curl -s http://127.0.0.1:9900/metrics
 
 ```
 crates/gpu-core     调度核心:领域模型 + 纯状态机(零 I/O,全量单测)
-crates/nvmlx        NVML 访问抽象:DeviceProvider trait + NullProvider(mock)
-crates/gpu-daemon   守护进程:gRPC API + Enforcer(进程启动) + Job 编排 + 监控
+crates/nvmlx        NVML 访问抽象:DeviceProvider trait + NullProvider(mock) + NvmlProvider(真机)
+crates/gpu-api      proto/gpu.proto → tonic/prost 代码生成(vendored protoc,免安装)
+crates/gpu-daemon   守护进程:api(gRPC) + state/monitor(状态与轮询)
+                    + enforcer/cgroup(进程启动与强制) + identity/audit(身份与审计)
+                    + jobs/faults/recovery/xid(作业编排与故障恢复) + metrics
 crates/gpu-cli      CLI 客户端:ls/watch/run/jobs/queue/kill
-proto/              V1 gRPC 接口契约(vendored protoc 生成)
+proto/              V1 gRPC 接口契约
 ```
 
 ## 里程碑
 
 | 里程碑 | 状态 |
 |---|---|
-| M0 骨架(workspace + proto + crate 划分) | ✅ |
-| M1 设备发现与监控(NVML 枚举、轮询、/metrics) | ✅ |
-| M2 整卡分配闭环(SubmitJob → 启动 → 退出回收) | ✅ |
-| M3 强制与安全(device cgroup、setuid、审计、Kill 权限;pty 延后) | ✅ |
-| M4 故障与恢复(Xid 订阅、设备下线、重启恢复) | ✅ |
-| M5 公平与配额(多用户配额、公平份额、排队策略调优) | ✅ |
+| M0 骨架(workspace + proto + crate 划分) | ✅ 2026-08-25 |
+| M1 设备发现与监控(NVML 枚举、轮询、/metrics) | ✅ 2026-08-25 |
+| M2 整卡分配闭环(SubmitJob → 启动 → 退出回收) | ✅ 2026-08-26 |
+| M3 强制与安全(device cgroup、setuid、审计、Kill 权限;pty 延后) | ✅ 2026-08-26 |
+| M4 故障与恢复(Xid 订阅、设备下线、重启恢复) | ✅ 2026-08-27 |
+| M5 公平与配额(**v1 仅配额**:在飞卡数 / 并发作业数) | ✅ 2026-08-27 |
+
+> **v1 未落地**:公平份额(加权记账 / aging 防饿死)、排队策略调优、`spread` 放置策略(当前仅 `packing`)、pty 交互直通;
+> device cgroup 硬墙与 Xid 链路需真机复核。详见 [DESIGN.md](DESIGN.md) §7.2 / §15。

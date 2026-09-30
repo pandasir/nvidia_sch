@@ -154,6 +154,7 @@ Lease {
 - **分配算法（v1）**：请求 N 张卡 → 在空闲设备中选 N 张。两种放置策略可配置：
   - `packing`（默认）：优先填满碎片化较小的卡，减少整体碎片，提高利用率。
   - `spread`：分散到不同卡，降低单卡故障波及面。
+  > ⚠️ 实现现状：仅 `packing` 落地（按设备 UUID 稳定顺序取前 N 张空闲卡）。`spread` 未实现。
 - **公平份额**：按用户配额记账，防止单用户占满整机；超配额请求入队等待或拒绝（可配置）。
 - **无抢占**：v1 不抢占运行中任务。管理员 `KillJob` 是显式运维操作。
 
@@ -299,7 +300,6 @@ gpu-manager/                 (workspace)
 > M1 备注:为让 `gpu ls` 端到端可用,gRPC 传输层(proto 代码生成 + tonic over UDS)
 > 提前到 M1 落地,当前仅实现只读 RPC(ListDevices/WatchDevices/GetMetrics);
 > 作业类 RPC 在 M2 接入。protoc 解析优先 vendored 预编译二进制,免安装 protoc。
-| **M1 设备发现与监控** | NVML 枚举、轮询、/metrics | `gpu ls` 显示真实设备与实时状态 |
 | **M2 整卡分配闭环** | 状态机、队列、SubmitJob→启动→退出回收 | 两进程抢 1 张卡：一个跑完另一个才跑；kill 后卡立即释放 | ✅ 2026-08-26 完成 |
 
 > M2 备注：作业类 RPC(SubmitJob/GetJob/ListJobs/CancelJob/KillJob)与 CLI
@@ -320,7 +320,7 @@ gpu-manager/                 (workspace)
 > Kill/失败及 user/uid/设备。pty 交互直通未随 M3 落地(proto 无 I/O 流)，延后。
 > 验收：无卡容器(amd64)实测 alice 作业子进程 uid=1000、alice kill root
 > 作业被拒、v2 模式下无 cgroup 直接失败；真机 cgroup 硬墙仍需真机复核。
-| **M4 故障与恢复** | Xid 订阅、设备下线、重启恢复 | 杀进程 → 自动回收；重启 daemon → 状态正确恢复 |
+| **M4 故障与恢复** | Xid 订阅、设备下线、重启恢复 | 杀进程 → 自动回收；重启 daemon → 状态正确恢复 | ✅ 2026-08-27 完成 |
 > M4 已落地：**monitor 设备清单对账**(列表消失连续 2 轮 → 下线，防抖；新卡热插拔注册；消失卡复现 → 恢复上线)；
 > **faults**：设备下线撤销租约 + 杀整棵进程树(cgroup.kill + SIGKILL) + cgroup 清理，双信号(Xid 事件 / 清单消失)统一入口；
 > **Xid 订阅**(仅 Linux，nvml-wrapper EventSet，CRITICAL_XID_ERROR → 立即下线)；
@@ -328,7 +328,7 @@ gpu-manager/                 (workspace)
 > 恢复的孤儿进程退出码不可考(非其父进程,无法 wait)按"状态未知"回收为 Failed；daemon 退出不杀子进程。
 > 验收：amd64 容器实测提交 → 杀 daemon → 重启 → 作业恢复 Running → 自然结束自动回收 → 设备 Free → 新作业可运行；
 > 外部 SIGKILL 子进程 → reaper 自动回收并推进队列(单测/单元覆盖)；Xid 链路需真机复核(无卡环境不激活)。
-| **M5 公平与配额** | 多用户配额、公平份额、排队策略调优 | 配额测试用例通过 |
+| **M5 公平与配额** | 多用户配额、公平份额、排队策略调优 | 配额测试用例通过 | ✅ 2026-08-27 完成（v1 仅配额） |
 > M5 已落地(§7.3 v1 简版，`--max-gpus-per-user` / `--max-concurrent-jobs-per-user`，默认 0=不限)：
 > **在飞卡数配额**：超配额新请求**入队等待**；配额门禁先于资源检查，且只约束该用户自身 ——
 > 配额受限作业被跳过、不阻塞其他用户(与"资源不足整队阻塞"的 M2 队首阻塞语义区分)；
@@ -336,6 +336,8 @@ gpu-manager/                 (workspace)
 > 记账纯内存遍历(leases/jobs)，随调度快照持久化，重启后配额继续生效；
 > 旧状态文件缺配额字段 → `#[serde(default)]` 补 0(不限)，向后兼容。
 > 验收：amd64 容器实测同用户第 2 个作业排队 → kill 后自动运行完成；并发超限提交被拒(含配额提示)；63 测试全绿。
+> **v1 明确未落地**：**公平份额**(加权记账 / aging 防饿死)与**排队策略调优**均未实现，
+> 排队仍为「严格优先级 + 队首阻塞」；§7.2 的 `spread` 放置策略代码中不存在(仅 `packing`)。
 
 ## 16. 设计决策记录（ADR）
 
