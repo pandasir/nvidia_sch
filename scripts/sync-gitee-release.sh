@@ -17,6 +17,8 @@
 #   GITEE_REPO      除 --dry-run 外必需。仓库名，例如 nvidia_sch
 #   GITEE_API_BASE  可选，默认 https://gitee.com/api/v5
 #   GITEE_RETRY_MAX 可选，429/5xx 最大尝试次数，默认 4
+#   GITEE_UPLOAD_MAX_TIME 可选，单个附件上传的总超时秒数，默认 900
+#                  （跨境上传慢时需要更长；低于 1KB/s 持续 60s 会主动放弃并重试）
 #
 # 行为:
 #   1. 用令牌探测仓库可见性，区分「令牌无效」与「仓库不可见」
@@ -249,7 +251,13 @@ for f in "${FILES[@]}"; do
   done
 
   log "上传 ${fname} ($(wc -c < "$f" | tr -d ' ') 字节)"
-  http POST "${REPO_PATH}/releases/${RELEASE_ID}/attach_files" -F "file=@${f}"
+  http POST "${REPO_PATH}/releases/${RELEASE_ID}/attach_files" \
+    --max-time "${GITEE_UPLOAD_MAX_TIME:-900}" \
+    --connect-timeout 20 \
+    --speed-limit 1024 --speed-time 60 \
+    --retry 3 --retry-delay 5 \
+    -H 'Expect:' \
+    -F "file=@${f}"
   case "$STATUS" in
     200|201) ;;
     401) die "上传附件时令牌无效 (HTTP 401): $(short_body)" ;;

@@ -246,11 +246,13 @@ jobs:
     needs: [guard, build, github]
     runs-on: ubuntu-22.04
     steps:
-      - name: 检出 tag
+      - name: 检出默认分支（脚本与产物分开取）
+        # 产物与 notes 来自 tag 的构建 artifact；发布脚本取默认分支，
+        # 这样修复脚本后可以直接重跑旧 tag 的发布，不需要重新打 tag。
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.guard.outputs.tag }}
-          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
 
       - name: 取回产物
         uses: actions/download-artifact@v4
