@@ -24,13 +24,13 @@
 ## 5. GitHub Pages 部署
 
 - [x] 5.1 新增可复用的站点部署工作流，包含构建、Pages artifact 上传和部署步骤，并通过手动触发验证工作流成功完成
-- [ ] 5.2 在 GitHub Pages 设置中选择 GitHub Actions 作为来源，并访问 `/nvidia_sch/`、`/nvidia_sch/download/` 和 `/nvidia_sch/guide/quick-start/` 验证均返回 200
-- [ ] 5.3 对部署后的站点执行资源与链接检查，验证 CSS、JS、图片和站内链接没有 404
+- [x] 5.2 在 GitHub Pages 设置中选择 GitHub Actions 作为来源，并访问 `/nvidia_sch/`、`/nvidia_sch/download/` 和 `/nvidia_sch/guide/quick-start/` 验证均返回 200
+- [x] 5.3 对部署后的站点执行资源与链接检查，验证 CSS、JS、图片和站内链接没有 404
 
 ## 6. 发布流程联动
 
-- [ ] 6.1 修改发布流程，在正式 release 成功后更新版本清单，并用模拟数据验证只有语义版本更高的正式版本会替换当前稳定版本
-- [ ] 6.2 在清单中记录 Gitee 镜像可用性，并用 Gitee 发布失败场景验证 `gitee.available=false` 会被正确写入
+- [x] 6.1 修改发布流程，在正式 release 成功后更新版本清单，并用模拟数据验证只有语义版本更高的正式版本会替换当前稳定版本
+- [x] 6.2 在清单中记录 Gitee 镜像可用性，并用 Gitee 发布失败场景验证 `gitee.available=false` 会被正确写入
 - [ ] 6.3 在发布流程更新清单后显式触发站点部署工作流，并通过一次手工重跑验证站点能读取更新后的版本数据
 - [ ] 6.4 修改 README 的安装与快速开始入口，使官网成为下载和试用首选入口，并通过 README 检查确认仍保留完整技术文档链接且无仓库内 `dist/` 下载指引
 

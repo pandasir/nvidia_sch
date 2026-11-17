@@ -16,6 +16,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: release-${{ github.event.inputs.tag || github.ref_name }}
@@ -281,3 +282,53 @@ jobs:
             --name "GPU Manager ${TAG}" \
             --body-file dist-assets/NOTES.md \
             --target-commitish "$COMMIT"
+
+  site:
+    name: site-release-manifest
+    # GitHub Release 成功后才更新官网版本清单；Gitee 失败也要记录为镜像不可用。
+    needs: [guard, github, gitee]
+    if: always() && needs.guard.result == 'success' && needs.github.result == 'success'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检出默认分支
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 更新站点版本清单并触发部署
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.guard.outputs.tag }}
+          PRE: ${{ needs.guard.outputs.prerelease }}
+          GITEE_RESULT: ${{ needs.gitee.result }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          GITEE_AVAILABLE=false
+          if [ "$GITEE_RESULT" = "success" ]; then
+            GITEE_AVAILABLE=true
+          fi
+
+          node scripts/update-site-release.mjs \
+            --tag "$TAG" \
+            --prerelease "$PRE" \
+            --gitee-available "$GITEE_AVAILABLE"
+
+          if git diff --quiet -- docs/public/release.json; then
+            echo "站点版本清单未变化，跳过提交与部署"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/public/release.json
+          git commit -m "chore(site): update release manifest to ${TAG}"
+          git push origin "HEAD:${DEFAULT_BRANCH}"
+          gh workflow run deploy-site.yml --ref "$DEFAULT_BRANCH"
