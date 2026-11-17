@@ -8,8 +8,8 @@ export default defineConfig({
   themeConfig: {
     nav: [
       { text: '首页', link: '/' },
-      { text: '下载', link: '/download' },
-      { text: '快速开始', link: '/guide/quick-start' },
+      { text: '下载', link: '/download/' },
+      { text: '快速开始', link: '/guide/quick-start/' },
       { text: 'GitHub', link: 'https://github.com/pandasir/nvidia_sch' },
       { text: 'Gitee', link: 'https://gitee.com/yydb/nvidia_sch' }
     ],
@@ -17,7 +17,7 @@ export default defineConfig({
       '/guide/': [
         {
           text: '指南',
-          items: [{ text: '快速开始', link: '/guide/quick-start' }]
+          items: [{ text: '快速开始', link: '/guide/quick-start/' }]
         }
       ]
     },

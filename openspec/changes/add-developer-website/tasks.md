@@ -23,7 +23,7 @@
 
 ## 5. GitHub Pages 部署
 
-- [ ] 5.1 新增可复用的站点部署工作流，包含构建、Pages artifact 上传和部署步骤，并通过手动触发验证工作流成功完成
+- [x] 5.1 新增可复用的站点部署工作流，包含构建、Pages artifact 上传和部署步骤，并通过手动触发验证工作流成功完成
 - [ ] 5.2 在 GitHub Pages 设置中选择 GitHub Actions 作为来源，并访问 `/nvidia_sch/`、`/nvidia_sch/download/` 和 `/nvidia_sch/guide/quick-start/` 验证均返回 200
 - [ ] 5.3 对部署后的站点执行资源与链接检查，验证 CSS、JS、图片和站内链接没有 404
 

@@ -8,10 +8,10 @@ hero:
   actions:
     - theme: brand
       text: 下载 v0.1.0
-      link: /download
+      link: /download/
     - theme: alt
       text: 3 分钟体验
-      link: /guide/quick-start
+      link: /guide/quick-start/
 
 features:
   - title: 整卡独占
@@ -44,7 +44,7 @@ gpu --socket-path "$SOCK" run --gpus=1 -- sleep 10
 gpu --socket-path "$SOCK" jobs
 ```
 
-完整步骤和真机部署方式见 [快速开始](/guide/quick-start)。
+完整步骤和真机部署方式见 [快速开始](/guide/quick-start/)。
 
 ## 工作原理
 
