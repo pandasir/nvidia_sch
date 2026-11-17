@@ -2,6 +2,14 @@
 
 GPU Manager 是一套运行在单台机器上的 NVIDIA GPU 调度与分配服务。它以**整卡独占**为粒度，负责设备发现、状态监控、作业排队、进程启动、资源回收和审计。客户端通过 Unix Domain Socket 调用本地 gRPC API， daemon 根据分配结果注入 `CUDA_VISIBLE_DEVICES`，并可通过 cgroup v2 对设备节点进行硬隔离。
 
+## 官网与快速入口
+
+- 官网：https://pandasir.github.io/nvidia_sch/
+- 下载：https://pandasir.github.io/nvidia_sch/download/
+- 3 分钟体验：https://pandasir.github.io/nvidia_sch/guide/quick-start/
+
+下面的安装与部署说明保留作为完整参考；首次试用建议从官网下载页开始。
+
 ## 功能概览
 
 - 通过 NVML 枚举和监控真实 GPU；也可使用 Null Provider 在无 GPU 环境中运行
@@ -50,6 +58,8 @@ GPU Manager 是一套运行在单台机器上的 NVIDIA GPU 调度与分配服�
 | Prometheus 指标 | `http://127.0.0.1:9900/metrics` | `http://127.0.0.1:9900/metrics` |
 
 ## 安装
+
+> 首次使用建议从[官网下载页](https://pandasir.github.io/nvidia_sch/download/)获取当前稳定版本。本节命令与官网下载页指向同一份 GitHub/Gitee Release 资产。
 
 ### 使用预编译包
 
@@ -176,6 +186,8 @@ RUST_LOG=gpu_daemon=debug gpu-daemon --provider nvml
 ```
 
 ## 快速开始：无 GPU 演示
+
+也可以按[官网快速开始](https://pandasir.github.io/nvidia_sch/guide/quick-start/)在浏览器中逐步操作；本节命令与其保持一致。
 
 启动 daemon：
 
