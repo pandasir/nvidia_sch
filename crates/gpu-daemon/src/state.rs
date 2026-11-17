@@ -105,6 +105,9 @@ fn is_zombie(pid: u32) -> bool {
 #[derive(Debug)]
 pub struct RunningProcess {
     pub handle: ProcHandle,
+    /// 关联的租约 ID(冗余保存于进程句柄旁:当 KillJob/DeviceOffline/LeaseExpired
+    /// 先一步移除 Scheduler 内的 Lease 后,reaper 收割已退出进程时仍能据以清理 cgroup)
+    pub lease_id: String,
     pub started_at_ms: u64,
 }
 

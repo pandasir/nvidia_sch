@@ -117,18 +117,20 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
     let discovered = provider.list_devices().context("设备枚举失败")?;
     info!("发现 {} 台设备", discovered.len());
 
-    let mut scheduler = Scheduler::new(SchedulerConfig {
+    let sched_cfg = SchedulerConfig {
         queue_timeout_secs: cfg.queue_timeout_secs,
         max_gpus_per_user: cfg.max_gpus_per_user,
         max_concurrent_jobs_per_user: cfg.max_concurrent_jobs_per_user,
         ..Default::default()
-    });
+    };
+    let mut scheduler = Scheduler::new(sched_cfg);
 
     // ---- M4 重启恢复:启动早期加载状态文件,重建已分配作业 ----
     // 文件存在即恢复(损坏则拒绝启动,不静默丢状态);恢复出的 Running 进程
     // 以孤儿 pid 接管,reaper 后续负责探测回收。
     let mut restored_running: Vec<(String, recovery::ProcRecord)> = Vec::new();
     let mut restored_owners: Vec<(String, (String, u32))> = Vec::new();
+    let mut restored_specs = std::collections::HashMap::new();
     if let Some(state_file) = &cfg.state_file {
         if state_file.exists() {
             let restored = recovery::load(state_file).with_context(|| {
@@ -141,8 +143,11 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
                 restored.outcome.collected_failed
             );
             scheduler = restored.scheduler;
+            // 用当前启动参数覆盖快照中的旧配置,确保重启时调整的 CLI 配额/超时参数生效
+            scheduler.set_config(sched_cfg);
             restored_running = restored.running;
             restored_owners = restored.owners;
+            restored_specs = restored.specs;
         } else {
             info!("状态文件不存在({}),全新启动", state_file.display());
         }
@@ -197,9 +202,13 @@ pub async fn run(cfg: DaemonConfig) -> anyhow::Result<()> {
         cfg.state_file.clone(),
     );
 
-    // 恢复出的孤儿进程接入注册表 + 身份记账(须在 reaper 启动前完成)
+    // 恢复出的孤儿进程接入注册表 + 启动规格 + 身份记账(须在 reaper 启动前完成)
     if !restored_running.is_empty() {
         recovery::attach_restored(&state, restored_running);
+    }
+    if !restored_specs.is_empty() {
+        let mut specs = state.specs.lock().expect("specs 锁");
+        specs.extend(restored_specs);
     }
     if !restored_owners.is_empty() {
         let mut owners = state.job_owners.lock().expect("job_owners 锁");

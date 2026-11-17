@@ -118,7 +118,28 @@ pub fn kill_job(state: &AppState, job_id: &str) -> Result<(), SchedulerError> {
     );
 
     // 杀整棵进程树:cgroup.kill 优先(含孙进程),再补发直接信号
-    if let Some(lid) = &lease_id {
+    terminate_job_process(state, job_id, lease_id.as_deref());
+    pump(state);
+    crate::recovery::persist(state);
+    Ok(())
+}
+
+/// 终止指定作业的进程树并尝试拆除其 cgroup(供 KillJob / 设备故障下线 / 租约过期回收 共用)。
+///
+/// 若调用瞬间子进程尚未被 wait 收割导致 `cgroup.destroy` 返回 `EBUSY`,进程句柄仍保留在
+/// `state.processes` 中(携带 `lease_id`),待 `pump()` 的 `try_wait()` 完成收割后会再次调用
+/// `cgroup.destroy` 确保目录被彻底移除。
+pub(crate) fn terminate_job_process(state: &AppState, job_id: &str, lease_id: Option<&str>) {
+    let proc_lease_id = state
+        .processes
+        .lock()
+        .expect("processes 锁")
+        .get(job_id)
+        .map(|rp| rp.lease_id.clone())
+        .filter(|id| !id.is_empty());
+    let lid = lease_id.map(str::to_owned).or(proc_lease_id);
+
+    if let Some(lid) = &lid {
         match state.cgroup.kill_all(lid) {
             Ok(()) => debug!("cgroup.kill 已清理 lease={lid}"),
             Err(e) => warn!("cgroup.kill 失败 lease={lid}: {e}"),
@@ -129,12 +150,9 @@ pub fn kill_job(state: &AppState, job_id: &str) -> Result<(), SchedulerError> {
             debug!("直接 kill 进程失败(可能已退出): job={job_id} err={e}");
         }
     }
-    if let Some(lid) = &lease_id {
-        let _ = state.cgroup.destroy(lid); // 尽力清理
+    if let Some(lid) = &lid {
+        let _ = state.cgroup.destroy(lid); // 尽力清理;若仍有僵尸进程将在 pump 收割后再次清理
     }
-    pump(state);
-    crate::recovery::persist(state);
-    Ok(())
 }
 
 /// 取消排队中的作业(仅 `Queued`;运行中请用 [`kill_job`])。
@@ -179,40 +197,53 @@ pub fn pump(state: &AppState) {
     let mut sched = state.scheduler.lock().expect("scheduler 锁");
     let mut changed = false; // M4:本轮是否有状态变更(决定是否持久化)
 
-    // ① 回收已退出的进程(同步 try_wait,不阻塞事件循环)
+    // ① 回收已退出的进程(同步 try_wait,不阻塞事件循环),并对仍存活的进程续期租约心跳
     //    success:Some(real) = 已知真实退出结果;None = 状态不可考(Orphan 接管)
-    let finished: Vec<(String, Option<bool>)> = {
+    let (finished, alive_jobs): (Vec<(String, Option<bool>, String)>, Vec<String>) = {
         let mut procs = state.processes.lock().expect("processes 锁");
         let mut done = Vec::new();
+        let mut alive = Vec::new();
         for (job_id, rp) in procs.iter_mut() {
             match rp.handle.try_wait() {
-                Ok(Some(status)) => done.push((job_id.clone(), status)),
-                Ok(None) => {}
+                Ok(Some(status)) => done.push((job_id.clone(), status, rp.lease_id.clone())),
+                Ok(None) => alive.push(job_id.clone()),
                 Err(e) => {
                     warn!("读取进程状态失败 job={job_id}: {e}");
-                    done.push((job_id.clone(), Some(false)));
+                    done.push((job_id.clone(), Some(false), rp.lease_id.clone()));
                 }
             }
         }
-        for (job_id, _) in &done {
+        for (job_id, _, _) in &done {
             procs.remove(job_id);
         }
-        done
+        (done, alive)
     };
+    // 为所有仍在运行的作业刷新租约心跳(DESIGN.md §6:daemon 内部自动续期)
+    for job_id in &alive_jobs {
+        let _ = sched.heartbeat(job_id);
+    }
     if !finished.is_empty() {
         changed = true;
     }
-    for (job_id, success) in finished {
-        let (owner, lease_id, devices) = {
-            let some_lease = sched.lease(&job_id).map(|l| (l.id.clone(), l.device_uuids.clone()));
-            let owner = state
+    for (job_id, success, rp_lease_id) in finished {
+        let ((owner, uid), lease_id, devices) = {
+            let some_lease = sched
+                .lease(&job_id)
+                .map(|l| (l.id.clone(), l.device_uuids.clone()));
+            let owner_uid = state
                 .job_owners
                 .lock()
                 .expect("job_owners 锁")
                 .get(&job_id)
-                .map(|(u, _)| u.clone())
+                .cloned()
                 .unwrap_or_default();
-            (owner, some_lease.as_ref().map(|(id, _)| id.clone()), some_lease.map(|(_, d)| d).unwrap_or_default())
+            let lid = if !rp_lease_id.is_empty() {
+                Some(rp_lease_id)
+            } else {
+                some_lease.as_ref().map(|(id, _)| id.clone())
+            };
+            let devs = some_lease.map(|(_, d)| d).unwrap_or_default();
+            (owner_uid, lid, devs)
         };
         if let Some(job) = sched.job(&job_id) {
             if !job.status.is_terminal() {
@@ -239,13 +270,13 @@ pub fn pump(state: &AppState) {
                         AuditEvent::JobFailed
                     },
                     &owner,
-                    0,
+                    uid,
                     Some(&job_id),
                     &devices,
                     detail,
                 );
             }
-            // 已被 KillJob 先置终态:跳过(设备早已释放)
+            // 已被 KillJob/DeviceOffline/LeaseExpired 先置终态:跳过状态机流转,但下方仍执行 cgroup.destroy
         }
         if let Some(lid) = &lease_id {
             let _ = state.cgroup.destroy(lid);
@@ -257,6 +288,21 @@ pub fn pump(state: &AppState) {
     audit_sched_events(state, &events);
     if !events.is_empty() {
         changed = true;
+    }
+    // 若存在租约过期(LeaseExpired)被调度器回收的作业,必须同步强杀其残留进程并清理 cgroup,
+    // 防止旧进程继续占用已释放给新作业的物理 GPU
+    let expired_jobs: Vec<String> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            SchedulerEvent::JobFailed {
+                job_id,
+                reason: FailureReason::LeaseExpired,
+            } => Some(job_id.clone()),
+            _ => None,
+        })
+        .collect();
+    for job_id in &expired_jobs {
+        terminate_job_process(state, job_id, None);
     }
 
     // ③ 拉起"已分配但尚无进程"的作业
@@ -344,23 +390,27 @@ fn spawn_one(sched: &mut Scheduler, state: &AppState, job_id: &str) {
             .collect()
     };
     let whitelist = cgroup::whitelist_for(&lease_snaps);
-    if let Err(e) = state.cgroup.create(&lease.id, &whitelist) {
-        warn!("cgroup 创建失败 job={job_id} lease={}: {e}", lease.id);
+    let lease_id = lease.id.clone();
+    let lease_devices = lease.device_uuids.clone();
+    if let Err(e) = state.cgroup.create(&lease_id, &whitelist) {
+        warn!("cgroup 创建失败 job={job_id} lease={lease_id}: {e}");
         fail_spawn(sched, state, job_id, &format!("cgroup 隔离失败: {e}"));
         return;
     }
 
-    match enforcer::spawn_with_gpus(&spec, &lease.device_uuids) {
+    match enforcer::spawn_with_gpus(&spec, &lease_devices) {
         Ok(child) => {
             let Some(pid) = child.id() else {
-                // spawn 成功但拿不到 pid(理论不发生):按启动失败处理
+                // spawn 成功但拿不到 pid(理论不发生):拆除刚建的 cgroup 并按启动失败处理
+                let _ = state.cgroup.destroy(&lease_id);
                 fail_spawn(sched, state, job_id, "无法获取子进程 pid");
                 return;
             };
             // 加入 cgroup 失败(隔离未生效)也视为启动失败
-            if let Err(e) = state.cgroup.add_pid(&lease.id, pid) {
+            if let Err(e) = state.cgroup.add_pid(&lease_id, pid) {
                 let mut child = child;
                 let _ = child.start_kill();
+                let _ = state.cgroup.destroy(&lease_id);
                 fail_spawn(
                     sched,
                     state,
@@ -377,6 +427,7 @@ fn spawn_one(sched: &mut Scheduler, state: &AppState, job_id: &str) {
                     job_id.to_string(),
                     RunningProcess {
                         handle: ProcHandle::Tokio(child),
+                        lease_id,
                         started_at_ms: now_ms(),
                     },
                 );
@@ -387,6 +438,7 @@ fn spawn_one(sched: &mut Scheduler, state: &AppState, job_id: &str) {
         }
         Err(e) => {
             warn!("进程启动失败 job={job_id}: {e}");
+            let _ = state.cgroup.destroy(&lease_id);
             fail_spawn(sched, state, job_id, &format!("进程启动失败: {e}"));
         }
     }
@@ -563,11 +615,16 @@ mod tests {
             .spawn()
             .expect("spawn");
         let pid = child.id();
+        let lease_id = sched
+            .lease(&job_id)
+            .map(|l| l.id.clone())
+            .unwrap_or_default();
         let mut procs = state.processes.lock().unwrap();
         procs.insert(
             job_id.clone(),
             RunningProcess {
                 handle: ProcHandle::Orphan { pid },
+                lease_id,
                 started_at_ms: now_ms(),
             },
         );
@@ -657,5 +714,186 @@ mod tests {
             "B 应占用 A 释放的 gpu-0"
         );
         drop(sched);
+    }
+
+    /// P0 验证 1:pump 会为仍在运行的进程自动调用 heartbeat 续期租约
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pump_renews_lease_heartbeat_for_alive_processes() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            queue_timeout_secs: 3600,
+            lease_ttl_secs: 10,
+            ..Default::default()
+        });
+        scheduler.upsert_device(gpu_core::model::DeviceInfo {
+            uuid: "gpu-0".into(),
+            name: "t".into(),
+            pci_bus_id: "".into(),
+            memory_total_mib: 16384,
+            state: gpu_core::model::DeviceState::Free,
+        });
+        let state = AppState::new(
+            scheduler,
+            vec![DeviceSnapshot {
+                uuid: "gpu-0".into(),
+                name: "t".into(),
+                pci_bus_id: "".into(),
+                memory_total_mib: 16384,
+                unix_minor: None,
+            }],
+            Arc::new(AuditLog::new(None).unwrap()),
+            Arc::new(NoopCgroup),
+            None,
+        );
+
+        let (job_id, status) = submit_job(
+            &state,
+            SubmitRequest {
+                owner: "tester".into(),
+                description: "".into(),
+                gpus_requested: 1,
+                priority: 5,
+                queue_timeout_secs: None,
+            },
+            SpawnSpec {
+                command: vec!["/bin/sleep".into(), "10".into()],
+                ..Default::default()
+            },
+            501,
+        )
+        .unwrap();
+        assert_eq!(status, JobStatus::Running);
+        let initial_expires = state
+            .scheduler
+            .lock()
+            .unwrap()
+            .lease(&job_id)
+            .unwrap()
+            .expires_at_ms;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        pump(&state);
+
+        let renewed_expires = state
+            .scheduler
+            .lock()
+            .unwrap()
+            .lease(&job_id)
+            .unwrap()
+            .expires_at_ms;
+        assert!(
+            renewed_expires > initial_expires,
+            "pump 应刷新存活进程的租约过期时间 ({renewed_expires} > {initial_expires})"
+        );
+        let _ = kill_job(&state, &job_id);
+    }
+
+    /// P0 验证 2:spawn 失败(如命令不存在)与 kill_job 收割后均应调用 cgroup.destroy
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cgroup_destroyed_on_spawn_failure_and_kill_reap() {
+        use crate::cgroup::FakeCgroup;
+
+        let fake_cg = Arc::new(FakeCgroup::default());
+        let mut scheduler = Scheduler::new(SchedulerConfig::default());
+        scheduler.upsert_device(gpu_core::model::DeviceInfo {
+            uuid: "gpu-0".into(),
+            name: "t".into(),
+            pci_bus_id: "".into(),
+            memory_total_mib: 16384,
+            state: gpu_core::model::DeviceState::Free,
+        });
+        let state = AppState::new(
+            scheduler,
+            vec![DeviceSnapshot {
+                uuid: "gpu-0".into(),
+                name: "t".into(),
+                pci_bus_id: "".into(),
+                memory_total_mib: 16384,
+                unix_minor: None,
+            }],
+            Arc::new(AuditLog::new(None).unwrap()),
+            fake_cg.clone(),
+            None,
+        );
+
+        // (a) 启动不存在的二进制:create 后必须立即 destroy,不泄漏 cgroup
+        let (bad_job, bad_status) = submit_job(
+            &state,
+            SubmitRequest {
+                owner: "tester".into(),
+                description: "".into(),
+                gpus_requested: 1,
+                priority: 5,
+                queue_timeout_secs: None,
+            },
+            SpawnSpec {
+                command: vec!["/nonexistent-binary-xyz-123".into()],
+                ..Default::default()
+            },
+            501,
+        )
+        .unwrap();
+        assert_eq!(bad_status, JobStatus::Failed);
+        {
+            let calls = fake_cg.calls.lock().unwrap();
+            assert!(
+                calls.iter().any(|c| c.starts_with("create ")),
+                "应已调用 create: {calls:?}"
+            );
+            assert!(
+                calls.iter().any(|c| c.starts_with("destroy ")),
+                "spawn 失败后必须立即调用 destroy 清理 cgroup: {calls:?}"
+            );
+        }
+        let _ = bad_job;
+        fake_cg.calls.lock().unwrap().clear();
+
+        // (b) 正常启动 → kill_job → 进程收割后凭 RunningProcess.lease_id 再次确保 destroy
+        let (ok_job, ok_status) = submit_job(
+            &state,
+            SubmitRequest {
+                owner: "tester".into(),
+                description: "".into(),
+                gpus_requested: 1,
+                priority: 5,
+                queue_timeout_secs: None,
+            },
+            SpawnSpec {
+                command: vec!["/bin/sleep".into(), "30".into()],
+                ..Default::default()
+            },
+            501,
+        )
+        .unwrap();
+        assert_eq!(ok_status, JobStatus::Running);
+        let lease_id = state
+            .scheduler
+            .lock()
+            .unwrap()
+            .lease(&ok_job)
+            .unwrap()
+            .id
+            .clone();
+
+        kill_job(&state, &ok_job).unwrap();
+        for _ in 0..30 {
+            if !state.processes.lock().unwrap().contains_key(&ok_job) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            pump(&state);
+        }
+        assert!(
+            !state.processes.lock().unwrap().contains_key(&ok_job),
+            "被 kill 的进程应被 pump 收割移除"
+        );
+        let calls = fake_cg.calls.lock().unwrap();
+        assert!(
+            calls.contains(&format!("kill_all {lease_id}")),
+            "应调用 kill_all: {calls:?}"
+        );
+        assert!(
+            calls.contains(&format!("destroy {lease_id}")),
+            "应调用 destroy: {calls:?}"
+        );
     }
 }

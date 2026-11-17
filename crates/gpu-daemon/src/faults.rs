@@ -55,20 +55,7 @@ pub fn handle_device_offline(state: &Arc<AppState>, uuid: &str) {
 
     // 杀所有受影响作业的进程树(cgroup.kill + 直接信号;尽力而为)
     for (job_id, lease_id, _devices) in &affected {
-        if let Err(e) = state.cgroup.kill_all(lease_id) {
-            debug!("cgroup.kill 失败 lease={lease_id}: {e}");
-        }
-        if let Some(rp) = state
-            .processes
-            .lock()
-            .expect("processes 锁")
-            .get_mut(job_id)
-        {
-            if let Err(e) = rp.handle.start_kill() {
-                debug!("设备下线杀进程失败(可能已退出): job={job_id} err={e}");
-            }
-        }
-        let _ = state.cgroup.destroy(lease_id);
+        jobs::terminate_job_process(state, job_id, Some(lease_id));
     }
 
     state.audit.record(

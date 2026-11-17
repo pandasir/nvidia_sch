@@ -492,6 +492,11 @@ impl Scheduler {
         &self.config
     }
 
+    /// 更新调度器配置(如 daemon 重启恢复快照后应用最新 CLI 配额/超时参数)
+    pub fn set_config(&mut self, config: SchedulerConfig) {
+        self.config = config;
+    }
+
     // ---------- 快照 / 恢复 ----------
 
     pub fn snapshot(&self) -> SchedulerSnapshot {

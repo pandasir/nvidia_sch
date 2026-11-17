@@ -17,7 +17,7 @@ use crate::DeviceSnapshot;
 use std::path::Path;
 
 /// 设备访问白名单条目:(major, minor, access 掩码)
-/// access:1=read, 2=write, 4=mknod;GPU 需要全部(7)
+/// access(内核 BPF_DEVCG_ACC_*):1=mknod, 2=read, 4=write;GPU 需要全部(7)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DevSpec {
     pub major: u32,
@@ -227,38 +227,44 @@ mod v2 {
 pub use v2::V2Cgroup;
 
 // ---------------------------------------------------------------------------
-// 设备过滤 eBPF 程序(仅 Linux)
+// 设备过滤 eBPF 程序(指令构造跨平台可测,系统调用仅 Linux)
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 mod bpf {
     use super::DevSpec;
 
     /// bpf(2) 系统调用命令
+    #[cfg(target_os = "linux")]
     const BPF_PROG_LOAD: i32 = 5;
+    #[cfg(target_os = "linux")]
     const BPF_PROG_ATTACH: i32 = 7;
+    #[cfg(target_os = "linux")]
     const BPF_PROG_DETACH: i32 = 8;
 
     /// BPF_PROG_TYPE_CGROUP_DEVICE
+    #[cfg(target_os = "linux")]
     const PROG_TYPE_CGROUP_DEVICE: u32 = 15;
     /// bpf_attach_type::BPF_CGROUP_DEVICE
+    #[cfg(target_os = "linux")]
     const ATTACH_TYPE_CGROUP_DEVICE: u32 = 4;
 
     /// eBPF 指令(code | dst:src 打包)
     #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct Insn {
-        code: u8,
-        dst_src: u8, // 高 4 位 dst,低 4 位 src
-        off: i16,
-        imm: i32,
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct Insn {
+        pub(super) code: u8,
+        pub(super) dst_src: u8, // 低 4 位 dst,高 4 位 src(小端位域:dst:4, src:4)
+        pub(super) off: i16,
+        pub(super) imm: i32,
     }
 
     impl Insn {
         const fn new(code: u8, dst: u8, src: u8, off: i16, imm: i32) -> Self {
             Self {
                 code,
-                dst_src: (dst << 4) | src,
+                // Linux eBPF 规范(小端):byte 1 低 4 位为 dst_reg,高 4 位为 src_reg
+                dst_src: (src << 4) | (dst & 0x0f),
                 off,
                 imm,
             }
@@ -267,54 +273,72 @@ mod bpf {
         const fn ldx_w(dst: u8, src: u8, off: i16) -> Self {
             Self::new(0x61, dst, src, off, 0) // BPF_LDX|BPF_MEM|BPF_W
         }
+        /// rX >>= imm (32 位无符号右移)
+        const fn rsh32_imm(dst: u8, imm: i32) -> Self {
+            Self::new(0x74, dst, 0, 0, imm) // BPF_ALU|BPF_RSH|BPF_K
+        }
+        /// rX = rY (32 位寄存器拷贝)
+        const fn mov32_reg(dst: u8, src: u8) -> Self {
+            Self::new(0xbc, dst, src, 0, 0) // BPF_ALU|BPF_MOV|BPF_X
+        }
+        /// if rX == imm goto +off (64 位比较)
+        const fn jeq_imm(dst: u8, imm: i32, off: i16) -> Self {
+            Self::new(0x15, dst, 0, off, imm) // BPF_JMP|BPF_JEQ|BPF_K
+        }
         /// if rX != imm goto +off (64 位比较)
         const fn jne_imm(dst: u8, imm: i32, off: i16) -> Self {
-            Self::new(0x55, dst, 0, off, imm) // BPF_JMP|BPF_JNE
+            Self::new(0x55, dst, 0, off, imm) // BPF_JMP|BPF_JNE|BPF_K
         }
         /// rX &= imm (32 位)
         const fn and_imm(dst: u8, imm: i32) -> Self {
-            Self::new(0x54, dst, 0, 0, imm) // BPF_ALU|BPF_AND
+            Self::new(0x54, dst, 0, 0, imm) // BPF_ALU|BPF_AND|BPF_K
         }
         /// r0 = imm
         const fn mov64_imm(dst: u8, imm: i32) -> Self {
-            Self::new(0xb7, dst, 0, 0, imm) // BPF_ALU64|BPF_MOV
+            Self::new(0xb7, dst, 0, 0, imm) // BPF_ALU64|BPF_MOV|BPF_K
         }
-        /// exit(imm 为返回值)
-        const fn exit(imm: i32) -> Self {
-            Self::new(0x95, 0, 0, 0, imm) // BPF_JMP|BPF_EXIT
+        /// exit(返回值由 r0 决定;内核 verifier 强制要求 imm == 0)
+        const fn exit() -> Self {
+            Self::new(0x95, 0, 0, 0, 0) // BPF_JMP|BPF_EXIT
         }
     }
 
     /// 生成 cgroup_device 过滤程序:白名单内 allow(1),否则 deny(0)。
     ///
     /// ctx(内核):`struct bpf_cgroup_dev_ctx { access_type:u32; major:u32; minor:u32; }`
-    fn build_program(allow: &[DevSpec]) -> Vec<Insn> {
+    /// 其中 `access_type = (BPF_DEVCG_ACC_* << 16) | BPF_DEVCG_DEV_*`。
+    pub(super) fn build_program(allow: &[DevSpec]) -> Vec<Insn> {
         const R1: u8 = 1; // ctx
         let mut prog = vec![
-            Insn::ldx_w(6, R1, 0), // r6 = access_type
-            Insn::ldx_w(7, R1, 4), // r7 = major
-            Insn::ldx_w(8, R1, 8), // r8 = minor
+            Insn::ldx_w(6, R1, 0),     // r6 = access_type
+            Insn::rsh32_imm(6, 16),    // r6 = access_type >> 16 (提取 BPF_DEVCG_ACC_* 掩码)
+            Insn::ldx_w(7, R1, 4),     // r7 = major
+            Insn::ldx_w(8, R1, 8),     // r8 = minor
         ];
         for dev in allow {
             let start = prog.len();
-            prog.push(Insn::jne_imm(7, dev.major as i32, 0)); // 位置 start+0
-            prog.push(Insn::jne_imm(8, dev.minor as i32, 0)); // start+1
-            prog.push(Insn::and_imm(6, dev.access as i32)); // start+2: r6 &= access
-            prog.push(Insn::jne_imm(6, 0, 0)); // start+3: access 位为空 → 跳过
-            prog.push(Insn::mov64_imm(0, 1)); // allow
-            prog.push(Insn::exit(1));
+            prog.push(Insn::jne_imm(7, dev.major as i32, 0)); // start+0: major 不匹配 → 跳下一条
+            prog.push(Insn::jne_imm(8, dev.minor as i32, 0)); // start+1: minor 不匹配 → 跳下一条
+            prog.push(Insn::jeq_imm(6, 0, 0));                // start+2: 请求掩码为空 → 跳下一条
+            prog.push(Insn::mov32_reg(9, 6));                 // start+3: r9 = r6 (保留 r6 供后续条目)
+            prog.push(Insn::and_imm(9, !(dev.access as i32))); // start+4: r9 &= !dev.access (筛出越权位)
+            prog.push(Insn::jne_imm(9, 0, 0));                // start+5: 含未授权访问位 → 跳下一条
+            prog.push(Insn::mov64_imm(0, 1));                 // start+6: allow (r0 = 1)
+            prog.push(Insn::exit());                          // start+7: exit (imm = 0)
             let next = prog.len() as i16;
-            // JNE 的 off 相对下一条指令
+            // JEQ/JNE 的 off 相对下一条指令
             prog[start].off = next - (start as i16 + 1);
             prog[start + 1].off = next - (start as i16 + 2);
-            prog[start + 3].off = next - (start as i16 + 4);
+            prog[start + 2].off = next - (start as i16 + 3);
+            prog[start + 5].off = next - (start as i16 + 6);
         }
-        prog.push(Insn::mov64_imm(0, 0)); // 默认 deny
-        prog.push(Insn::exit(0));
+        prog.push(Insn::mov64_imm(0, 0)); // 默认 deny (r0 = 0)
+        prog.push(Insn::exit());
         prog
     }
 
     /// bpf(2) 封装。attr 以 `[u64; N]` 手工按偏移填充(内核按字节读取)。
+    #[cfg(target_os = "linux")]
     unsafe fn bpf_sys(cmd: i32, attr: &[u64]) -> std::io::Result<i64> {
         // SAFETY: 原生系统调用;attr 指向本函数内存,内核仅在调用期间读取
         let rc = unsafe {
@@ -337,6 +361,7 @@ mod bpf {
     /// # Safety
     ///
     /// 仅由 L4 内核接口调用;prog/license 内存需在系统调用期间存活。
+    #[cfg(target_os = "linux")]
     unsafe fn load_and_attach(cgroup_fd: i32, allow: &[DevSpec]) -> std::io::Result<i32> {
         let prog = build_program(allow);
         let license = b"GPL\0";
@@ -364,12 +389,14 @@ mod bpf {
     }
 
     /// 创建 cgroup 设备过滤并 attach;返回 prog fd(由调用方负责 detach/close)
+    #[cfg(target_os = "linux")]
     pub fn attach_device_filter(cgroup_fd: i32, devices: &[DevSpec]) -> std::io::Result<i32> {
         // SAFETY: 封装原生内核接口;调用方保证 cgroup_fd 有效
         unsafe { load_and_attach(cgroup_fd, devices) }
     }
 
     /// detach 指定过滤程序
+    #[cfg(target_os = "linux")]
     pub fn detach_device_filter(cgroup_fd: i32, prog_fd: i32) -> std::io::Result<()> {
         let mut att = [0u64; 8];
         att[0] = cgroup_fd as u64 | ((prog_fd as u64) << 32);
@@ -385,25 +412,129 @@ mod bpf {
     mod tests {
         use super::*;
 
+        /// 迷你 eBPF 解释器:在测试中直接模拟内核执行 `build_program` 产出的指令序列,
+        /// 并校验 Linux 内核 verifier 的关键不变量(如 BPF_EXIT 保留字段必须为 0)。
+        fn eval_prog(prog: &[Insn], access_mask: u8, dev_type: u16, major: u32, minor: u32) -> u64 {
+            for (idx, insn) in prog.iter().enumerate() {
+                if insn.code == 0x95 {
+                    assert_eq!(insn.dst_src, 0, "insn[{idx}] BPF_EXIT dst_src 必须为 0");
+                    assert_eq!(insn.off, 0, "insn[{idx}] BPF_EXIT off 必须为 0");
+                    assert_eq!(insn.imm, 0, "insn[{idx}] BPF_EXIT imm 必须为 0(否则内核报 EINVAL)");
+                }
+            }
+            let ctx: [u32; 3] = [
+                ((access_mask as u32) << 16) | (dev_type as u32),
+                major,
+                minor,
+            ];
+            let mut regs = [0u64; 10];
+            let mut pc = 0usize;
+            while pc < prog.len() {
+                let insn = prog[pc];
+                let dst = (insn.dst_src & 0x0f) as usize;
+                let src = ((insn.dst_src >> 4) & 0x0f) as usize;
+                match insn.code {
+                    0x61 => {
+                        // ldx_w: dst = *(u32*)(ctx + off)
+                        assert_eq!(src, 1, "ldx_w 仅能从 r1(ctx) 读取");
+                        let word_idx = (insn.off / 4) as usize;
+                        regs[dst] = ctx[word_idx] as u64;
+                        pc += 1;
+                    }
+                    0x74 => {
+                        // rsh32_imm
+                        regs[dst] = ((regs[dst] as u32) >> (insn.imm as u32)) as u64;
+                        pc += 1;
+                    }
+                    0xbc => {
+                        // mov32_reg
+                        regs[dst] = (regs[src] as u32) as u64;
+                        pc += 1;
+                    }
+                    0x54 => {
+                        // and_imm (32-bit)
+                        regs[dst] = ((regs[dst] as u32) & (insn.imm as u32)) as u64;
+                        pc += 1;
+                    }
+                    0xb7 => {
+                        // mov64_imm
+                        regs[dst] = insn.imm as i64 as u64;
+                        pc += 1;
+                    }
+                    0x15 => {
+                        // jeq_imm
+                        if regs[dst] == (insn.imm as i64 as u64) {
+                            pc = ((pc as isize) + 1 + (insn.off as isize)) as usize;
+                        } else {
+                            pc += 1;
+                        }
+                    }
+                    0x55 => {
+                        // jne_imm
+                        if regs[dst] != (insn.imm as i64 as u64) {
+                            pc = ((pc as isize) + 1 + (insn.off as isize)) as usize;
+                        } else {
+                            pc += 1;
+                        }
+                    }
+                    0x95 => {
+                        // exit
+                        return regs[0];
+                    }
+                    other => panic!("未知 eBPF 指令 opcode: 0x{other:02x}"),
+                }
+            }
+            panic!("程序未以 BPF_EXIT 结束");
+        }
+
         #[test]
         fn program_layout_smoke() {
             let p = build_program(&[
                 DevSpec::new(195, 0),
                 DevSpec::new(1, 3), // /dev/null
             ]);
-            // 3 条 ctx 读取 + 每设备 6 条 + 2 条收尾
-            assert_eq!(p.len(), 3 + 6 * 2 + 2);
-            // 第一条 JNE 应跳过本设备的后续 4 条(到下一设备开头)
-            assert_eq!(p[3].off, (3 + 6 - 4) as i16);
-            // 默认分支 deny
+            // 4 条 prologue + 每设备 8 条 + 2 条收尾
+            assert_eq!(p.len(), 4 + 8 * 2 + 2);
+            // 第一条 JNE(位置 4)应跳到下一设备开头(位置 12),即 off = 12 - 5 = 7
+            assert_eq!(p[4].off, 7);
+            // 默认分支 deny 且 exit 的 imm 必须为 0
             let last = *p.last().unwrap();
             assert_eq!(last.code, 0x95);
+            assert_eq!(last.imm, 0);
         }
 
         #[test]
         fn empty_whitelist_denies_all() {
             let p = build_program(&[]);
-            assert_eq!(p.len(), 5); // 3 ctx + r0=0 + exit
+            assert_eq!(p.len(), 6); // 4 ctx + r0=0 + exit
+            assert_eq!(eval_prog(&p, 0b010, 2, 195, 0), 0);
+        }
+
+        #[test]
+        fn ebpf_allows_whitelisted_and_denies_others() {
+            let readonly_dev = DevSpec {
+                major: 195,
+                minor: 1,
+                access: 0b010, // 仅 READ(2)
+            };
+            let p = build_program(&[
+                DevSpec::new(1, 3),   // /dev/null (RW_MKNOD = 7)
+                DevSpec::new(195, 0), // gpu-0 (RW_MKNOD = 7)
+                readonly_dev,         // gpu-1 (仅 READ)
+            ]);
+
+            // 1. 命中的第二张设备(gpu-0):READ(2)、WRITE(4)、READ|WRITE(6) 均放行
+            assert_eq!(eval_prog(&p, 0b010, 2, 195, 0), 1, "gpu-0 READ 应放行");
+            assert_eq!(eval_prog(&p, 0b100, 2, 195, 0), 1, "gpu-0 WRITE 应放行");
+            assert_eq!(eval_prog(&p, 0b110, 2, 195, 0), 1, "gpu-0 RW 应放行");
+
+            // 2. 未分配的 gpu-2 (195, 2) 必须拒绝
+            assert_eq!(eval_prog(&p, 0b010, 2, 195, 2), 0, "未分配的 gpu-2 必须拒绝");
+
+            // 3. 只读设备(195, 1):READ(2) 放行,WRITE(4) 或 RW(6) 拒绝
+            assert_eq!(eval_prog(&p, 0b010, 2, 195, 1), 1, "gpu-1 READ 应放行");
+            assert_eq!(eval_prog(&p, 0b100, 2, 195, 1), 0, "gpu-1 WRITE 应拒绝");
+            assert_eq!(eval_prog(&p, 0b110, 2, 195, 1), 0, "gpu-1 RW 应拒绝");
         }
     }
 }
@@ -432,12 +563,20 @@ pub fn whitelist_for(devices: &[DeviceSnapshot]) -> Vec<DevSpec> {
 
     #[cfg(target_os = "linux")]
     {
-        if let Some(nvidia_major) = nvidia_major() {
-            // nvidiactl(固定 minor 255)
+        if let Some(nvidia_major) = proc_device_major("nvidia") {
+            // nvidiactl(固定 minor 255)与 nvidia-modeset(固定 minor 254)
             list.push(DevSpec::new(nvidia_major, 255));
-            // nvidia-uvm(杂项设备,主设备号 10)
-            if let Some(minor) = proc_misc_minor("nvidia-uvm") {
-                list.push(DevSpec::new(10, minor));
+            list.push(DevSpec::new(nvidia_major, 254));
+            // nvidia-uvm / nvidia-uvm-tools:独立字符设备主设备号(/proc/devices)
+            if let Some(uvm_major) = proc_device_major("nvidia-uvm") {
+                list.push(DevSpec::new(uvm_major, 0)); // /dev/nvidia-uvm
+                list.push(DevSpec::new(uvm_major, 1)); // /dev/nvidia-uvm-tools
+            }
+            // 兼容杂项设备注册形式(/proc/misc,主设备号 10)
+            for misc_name in ["nvidia-uvm", "nvidia-uvm-tools"] {
+                if let Some(minor) = proc_misc_minor(misc_name) {
+                    list.push(DevSpec::new(10, minor));
+                }
             }
             // 各已分配卡(主设备号为驱动 major)
             for d in devices {
@@ -464,15 +603,15 @@ pub fn whitelist_for(devices: &[DeviceSnapshot]) -> Vec<DevSpec> {
     list
 }
 
-/// 从 /proc/devices 解析 NVIDIA 驱动主设备号
+/// 从 /proc/devices 解析指定字符设备驱动的主设备号(如 nvidia、nvidia-uvm)
 #[cfg(target_os = "linux")]
-fn nvidia_major() -> Option<u32> {
+fn proc_device_major(driver: &str) -> Option<u32> {
     let s = std::fs::read_to_string("/proc/devices").ok()?;
     s.lines().find_map(|l| {
         let mut it = l.split_whitespace();
         let maj: u32 = it.next()?.parse().ok()?;
         let name = it.next()?;
-        (name == "nvidia").then_some(maj)
+        (name == driver).then_some(maj)
     })
 }
 
@@ -525,6 +664,9 @@ pub fn select_cgroup(
         },
     }
 }
+
+#[cfg(test)]
+pub(crate) use tests::FakeCgroup;
 
 #[cfg(test)]
 mod tests {

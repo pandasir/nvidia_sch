@@ -14,17 +14,18 @@
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 /// 子进程运行身份(None = 继承 daemon 身份;Some = 降权目标)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunAs {
     pub uid: u32,
     pub gid: u32,
 }
 
 /// 一份作业的进程启动规格(由 SubmitJob 请求解析而来)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnSpec {
     /// argv[0] 为可执行文件,其余为参数
     pub command: Vec<String>,

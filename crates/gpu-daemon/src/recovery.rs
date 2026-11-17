@@ -10,16 +10,18 @@
 //!   快照是恢复加速缓存。daemon 退出**不杀子进程**(M2 起
 //!   `kill_on_drop(false)`),这正是重启后能恢复 `Running` 的前提。
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use gpu_core::model::FailureReason;
+use gpu_core::model::{FailureReason, JobStatus};
 use gpu_core::scheduler::{Scheduler, SchedulerSnapshot};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::enforcer::SpawnSpec;
 use crate::state::{AppState, ProcHandle, RunningProcess};
 
 pub const STATE_FILE_VERSION: u32 = 1;
@@ -50,6 +52,9 @@ pub struct StateFile {
     pub scheduler: SchedulerSnapshot,
     pub processes: Vec<ProcRecord>,
     pub owners: Vec<OwnerRecord>,
+    /// 排队中/待拉起作业的启动规格:job_id -> SpawnSpec(重启恢复后供排队作业被分配时拉起进程)
+    #[serde(default)]
+    pub specs: HashMap<String, SpawnSpec>,
 }
 
 /// 恢复结果
@@ -68,6 +73,8 @@ pub struct Restored {
     pub running: Vec<(String, ProcRecord)>,
     /// job_id -> (username, uid)
     pub owners: Vec<(String, (String, u32))>,
+    /// job_id -> SpawnSpec
+    pub specs: HashMap<String, SpawnSpec>,
     pub outcome: RestoreOutcome,
 }
 
@@ -78,10 +85,11 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// 抓取当前状态为 [`StateFile`](锁顺序 scheduler → processes → job_owners)
+/// 抓取当前状态为 [`StateFile`](锁顺序 scheduler → processes → specs → job_owners)
 pub fn capture(state: &AppState) -> StateFile {
     let sched = state.scheduler.lock().expect("scheduler 锁");
     let procs = state.processes.lock().expect("processes 锁");
+    let specs = state.specs.lock().expect("specs 锁");
     let owners = state.job_owners.lock().expect("job_owners 锁");
     StateFile {
         version: STATE_FILE_VERSION,
@@ -92,9 +100,14 @@ pub fn capture(state: &AppState) -> StateFile {
             .filter_map(|(job_id, rp)| {
                 let pid = rp.handle.pid()?;
                 let lease = sched.lease(job_id);
+                let lease_id = if !rp.lease_id.is_empty() {
+                    rp.lease_id.clone()
+                } else {
+                    lease.map(|l| l.id.clone()).unwrap_or_default()
+                };
                 Some(ProcRecord {
                     job_id: job_id.clone(),
-                    lease_id: lease.map(|l| l.id.clone()).unwrap_or_default(),
+                    lease_id,
                     pid,
                     devices: lease.map(|l| l.device_uuids.clone()).unwrap_or_default(),
                     started_at_ms: rp.started_at_ms,
@@ -109,6 +122,7 @@ pub fn capture(state: &AppState) -> StateFile {
                 uid: *uid,
             })
             .collect(),
+        specs: specs.clone(),
     }
 }
 
@@ -175,6 +189,33 @@ pub fn load(path: &Path) -> anyhow::Result<Restored> {
         running.push((rec.job_id.clone(), rec.clone()));
     }
 
+    // 兜底对账:若调度快照中处于 Allocated/Running 的作业既不在存活进程列表中,
+    // 也不具备可重新拉起的 Allocated+SpawnSpec,则立即回收释放其占用的 GPU,防租约悬挂泄漏
+    let running_ids: std::collections::HashSet<&str> =
+        running.iter().map(|(id, _)| id.as_str()).collect();
+    let dangling: Vec<String> = scheduler
+        .jobs()
+        .filter(|j| match j.status {
+            JobStatus::Running => !running_ids.contains(j.id.as_str()),
+            JobStatus::Allocated => {
+                !running_ids.contains(j.id.as_str()) && !file.specs.contains_key(&j.id)
+            }
+            _ => false,
+        })
+        .map(|j| j.id.clone())
+        .collect();
+    for job_id in dangling {
+        debug!("重启恢复: 作业 {job_id} 缺少存活进程或启动规格,按失败回收并释放设备");
+        let _ = scheduler.finish(
+            &job_id,
+            false,
+            Some(FailureReason::Other(
+                "daemon 重启后缺少存活进程或启动规格".into(),
+            )),
+        );
+        collected += 1;
+    }
+
     let restored_count = running.len();
     let owners: Vec<(String, (String, u32))> = file
         .owners
@@ -186,6 +227,7 @@ pub fn load(path: &Path) -> anyhow::Result<Restored> {
         scheduler,
         running,
         owners,
+        specs: file.specs,
         outcome: RestoreOutcome {
             restored_running: restored_count,
             collected_failed: collected,
@@ -205,6 +247,7 @@ pub fn attach_restored(state: &Arc<AppState>, running: Vec<(String, ProcRecord)>
             job_id.clone(),
             RunningProcess {
                 handle: ProcHandle::Orphan { pid: rec.pid },
+                lease_id: rec.lease_id.clone(),
                 started_at_ms: rec.started_at_ms,
             },
         );
@@ -316,6 +359,7 @@ mod tests {
                 user: "bob".into(),
                 uid: 1000,
             }],
+            specs: HashMap::new(),
         };
         (job_id, file)
     }
@@ -353,6 +397,81 @@ mod tests {
         // 恢复的 scheduler:作业保持 Allocated(未回收)
         assert_eq!(restored.scheduler.job(&job_id).unwrap().status, JobStatus::Allocated);
         assert_eq!(restored.owners.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn queued_job_specs_persist_and_dangling_allocated_is_collected() {
+        let dir = std::env::temp_dir().join(format!("gpu-recovery-specs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state_specs.json");
+
+        let mut sched = Scheduler::new(Default::default());
+        sched.upsert_device(gpu_core::model::DeviceInfo {
+            uuid: "gpu-0".into(),
+            name: "t".into(),
+            pci_bus_id: "".into(),
+            memory_total_mib: 1,
+            state: gpu_core::model::DeviceState::Free,
+        });
+        // job_a 占用唯一 GPU,但快照中既无进程记录也无 spec(模拟异常悬挂)
+        let (job_a, _) = sched
+            .submit(SubmitRequest {
+                owner: "alice".into(),
+                description: "dangling".into(),
+                gpus_requested: 1,
+                priority: 5,
+                queue_timeout_secs: None,
+            })
+            .unwrap();
+        // job_b 排队中,附带完整 SpawnSpec
+        let (job_b, _) = sched
+            .submit(SubmitRequest {
+                owner: "bob".into(),
+                description: "queued".into(),
+                gpus_requested: 1,
+                priority: 5,
+                queue_timeout_secs: None,
+            })
+            .unwrap();
+        assert_eq!(sched.job(&job_b).unwrap().status, JobStatus::Queued);
+
+        let mut specs = HashMap::new();
+        specs.insert(
+            job_b.clone(),
+            SpawnSpec {
+                command: vec!["/bin/echo".into(), "ok".into()],
+                ..Default::default()
+            },
+        );
+        let file = StateFile {
+            version: STATE_FILE_VERSION,
+            written_at_ms: now_ms(),
+            scheduler: sched.snapshot(),
+            processes: vec![],
+            owners: vec![],
+            specs,
+        };
+        std::fs::write(&path, serde_json::to_string(&file).unwrap()).unwrap();
+
+        let restored = load(&path).unwrap();
+        // 悬挂的 job_a 应被自动回收并释放 gpu-0
+        assert_eq!(restored.outcome.collected_failed, 1);
+        assert_eq!(
+            restored.scheduler.job(&job_a).unwrap().status,
+            JobStatus::Failed
+        );
+        assert_eq!(restored.scheduler.free_count(), 1);
+        // 排队中的 job_b 及其 SpawnSpec 完整恢复
+        assert_eq!(
+            restored.scheduler.job(&job_b).unwrap().status,
+            JobStatus::Queued
+        );
+        assert_eq!(
+            restored.specs.get(&job_b).unwrap().command,
+            vec!["/bin/echo".to_string(), "ok".to_string()]
+        );
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }
