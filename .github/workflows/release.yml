@@ -1,0 +1,281 @@
+name: release
+
+# 发布由 tag 驱动：推送 v<semver> 的 annotated tag 即构建并同步发布到 GitHub 与 Gitee。
+# 手工重跑同一 tag 走完全相同的路径（幂等），用于补齐任一侧失败的发布。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag，例如 v0.1.0（需已存在于仓库）"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  guard:
+    name: guard
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      commit: ${{ steps.meta.outputs.commit }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - name: 检出 tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          fetch-depth: 0
+
+      - name: 校验 tag 与 workspace 版本
+        id: meta
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::tag 格式不合法: ${TAG}，期望 v<major>.<minor>.<patch>[-suffix]"
+            exit 1
+          fi
+
+          VERSION="${TAG#v}"
+          WS_VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ -z "$WS_VERSION" ]; then
+            echo "::error::无法从 Cargo.toml 读取 [workspace.package] version"
+            exit 1
+          fi
+          if [ "$WS_VERSION" != "$VERSION" ]; then
+            echo "::error::tag ${TAG} 与 workspace version ${WS_VERSION} 不一致；先把 Cargo.toml 的 [workspace.package] version 改成 ${VERSION} 并提交，再打 tag"
+            exit 1
+          fi
+
+          COMMIT="$(git rev-parse HEAD)"
+          TAG_COMMIT="$(git rev-parse "${TAG}^{commit}")"
+          if [ "$COMMIT" != "$TAG_COMMIT" ]; then
+            echo "::error::检出的 commit (${COMMIT}) 与 tag ${TAG} 指向的 commit (${TAG_COMMIT}) 不一致"
+            exit 1
+          fi
+
+          PRE=false
+          case "$TAG" in
+            *-rc*|*-alpha*|*-beta*|*-pre*) PRE=true ;;
+          esac
+
+          {
+            echo "tag=${TAG}"
+            echo "version=${VERSION}"
+            echo "commit=${COMMIT}"
+            echo "prerelease=${PRE}"
+          } >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG} version=${VERSION} commit=${COMMIT} prerelease=${PRE}"
+
+      - name: 确认 Gitee 侧 tag 已就位
+        # 公开仓库的 tag 列表可匿名读取，因此这一步不依赖任何令牌：
+        # 令牌失效只会让 gitee 发布 job 变红，而不会挡住 GitHub 发布。
+        env:
+          GITEE_OWNER: ${{ vars.GITEE_OWNER }}
+          GITEE_REPO: ${{ vars.GITEE_REPO }}
+          POLL_ATTEMPTS: "30"
+          POLL_INTERVAL: "2"
+        run: |
+          set -euo pipefail
+          if [ -z "${GITEE_OWNER:-}" ] || [ -z "${GITEE_REPO:-}" ]; then
+            echo "::error::未配置仓库变量 GITEE_OWNER / GITEE_REPO（Settings → Variables）"
+            exit 1
+          fi
+
+          TAG="${{ steps.meta.outputs.tag }}"
+          COMMIT="${{ steps.meta.outputs.commit }}"
+          BASE="https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}"
+
+          for i in $(seq 1 "${POLL_ATTEMPTS}"); do
+            body="$(curl -sS --max-time 20 "${BASE}/tags?per_page=100" 2>/dev/null || true)"
+            case "$body" in
+              *"Not Found Project"*)
+                echo "::error::Gitee 仓库 ${GITEE_OWNER}/${GITEE_REPO} 匿名不可见（可能仍是私有库），此检查无法进行"
+                exit 1
+                ;;
+            esac
+            sha="$(jq -r --arg t "$TAG" '[.[]? | select(.name == $t)][0].commit.sha // empty' <<<"${body:-[]}" 2>/dev/null || true)"
+            if [ -n "$sha" ]; then
+              if [ "$sha" != "$COMMIT" ]; then
+                echo "::error::Gitee 上的 tag ${TAG} 指向 ${sha}，与本次发布的 ${COMMIT} 不一致"
+                exit 1
+              fi
+              echo "Gitee tag 已就位: ${TAG} -> ${sha}"
+              exit 0
+            fi
+            sleep "${POLL_INTERVAL}"
+          done
+
+          echo "::error::等待约 $((POLL_ATTEMPTS * POLL_INTERVAL))s 后 Gitee 仍没有 tag ${TAG}；请先把 tag 推到 Gitee（git push origin ${TAG}）再重跑"
+          exit 1
+
+  build:
+    name: build
+    needs: guard
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检出 tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.tag }}
+          fetch-depth: 0
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85.0"
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: 测试
+        run: cargo test --workspace
+
+      - name: 构建
+        run: cargo build --release --workspace --bins
+
+      - name: 打包、校验与自检
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.guard.outputs.version }}"
+          OUT=dist-assets
+          ARCHIVE="gpu-manager-linux-amd64-${VERSION}.tar.gz"
+          ALIAS="gpu-manager-linux-amd64.tar.gz"
+
+          mkdir -p "${OUT}/linux-amd64"
+          cp target/release/gpu-daemon target/release/gpu "${OUT}/linux-amd64/"
+          cp README.md "${OUT}/linux-amd64/README.md"
+          tar -czf "${OUT}/${ARCHIVE}" -C "${OUT}" linux-amd64
+          # 不带版本号的文件名副本，给"latest"提供不随版本变化的下载地址
+          cp "${OUT}/${ARCHIVE}" "${OUT}/${ALIAS}"
+
+          expected=$(printf '%s\n' linux-amd64 linux-amd64/README.md linux-amd64/gpu linux-amd64/gpu-daemon | sort)
+          actual=$(tar -tzf "${OUT}/${ARCHIVE}" | sed 's:/$::' | sort)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::归档内容与预期不符"
+            printf 'expected:\n%s\nactual:\n%s\n' "$expected" "$actual"
+            exit 1
+          fi
+
+          ( cd "${OUT}" && sha256sum "${ARCHIVE}" "${ALIAS}" > SHA256SUMS && sha256sum -c SHA256SUMS )
+
+          for bin in gpu-daemon gpu; do
+            out="$("./target/release/${bin}" --version)"
+            echo "${out}"
+            if [[ "$out" != *"${VERSION}"* ]]; then
+              echo "::error::${bin} --version 输出与 tag 版本 ${VERSION} 不一致"
+              exit 1
+            fi
+          done
+
+          git tag -l --format='%(contents)' "${{ needs.guard.outputs.tag }}" > "${OUT}/NOTES.md"
+          if ! grep -q '[^[:space:]]' "${OUT}/NOTES.md"; then
+            echo "${{ needs.guard.outputs.tag }}" > "${OUT}/NOTES.md"
+          fi
+          ls -l "${OUT}"
+
+      - name: 传递产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          path: dist-assets/
+          if-no-files-found: error
+          retention-days: 7
+
+  github:
+    name: github-release
+    needs: [guard, build]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 取回产物
+        uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+          path: dist-assets
+
+      - name: 创建或更新 GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.guard.outputs.tag }}
+          VERSION: ${{ needs.guard.outputs.version }}
+          PRE: ${{ needs.guard.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          ARCHIVE="dist-assets/gpu-manager-linux-amd64-${VERSION}.tar.gz"
+          ASSETS=("${ARCHIVE}" "dist-assets/gpu-manager-linux-amd64.tar.gz" "dist-assets/SHA256SUMS")
+          ls -l "${ASSETS[@]}" dist-assets/NOTES.md
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release ${TAG} 已存在，更新描述与附件"
+            if [ "$PRE" = "true" ]; then
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file dist-assets/NOTES.md --prerelease
+            else
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file dist-assets/NOTES.md --prerelease=false
+            fi
+            gh release upload "$TAG" "${ASSETS[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            echo "创建 release ${TAG}"
+            if [ "$PRE" = "true" ]; then
+              gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" \
+                --notes-file dist-assets/NOTES.md --prerelease "${ASSETS[@]}"
+            else
+              gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" \
+                --notes-file dist-assets/NOTES.md "${ASSETS[@]}"
+            fi
+          fi
+
+  gitee:
+    name: gitee-release
+    # 排在 GitHub release 之后：Gitee 侧失败不会影响已发布的 GitHub release，
+    # 也不应因为 Gitee 失败而重跑 GitHub 那一步。
+    needs: [guard, build, github]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检出 tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.tag }}
+          fetch-depth: 0
+
+      - name: 取回产物
+        uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+          path: dist-assets
+
+      - name: 同步到 Gitee
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_OWNER: ${{ vars.GITEE_OWNER }}
+          GITEE_REPO: ${{ vars.GITEE_REPO }}
+          TAG: ${{ needs.guard.outputs.tag }}
+          VERSION: ${{ needs.guard.outputs.version }}
+          COMMIT: ${{ needs.guard.outputs.commit }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GITEE_TOKEN:-}" ]; then
+            echo "::error::未配置 GITEE_TOKEN secret（需要 projects 权限的私人令牌）"
+            exit 1
+          fi
+          bash scripts/sync-gitee-release.sh "$TAG" \
+            --assets "dist-assets/gpu-manager-linux-amd64-${VERSION}.tar.gz" \
+            --assets "dist-assets/gpu-manager-linux-amd64.tar.gz" \
+            --assets "dist-assets/SHA256SUMS" \
+            --name "GPU Manager ${TAG}" \
+            --body-file dist-assets/NOTES.md \
+            --target-commitish "$COMMIT"

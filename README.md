@@ -33,7 +33,7 @@ GPU Manager 是一套运行在单台机器上的 NVIDIA GPU 调度与分配服�
 
 ### Linux 生产部署
 
-- x86-64 Linux 与 glibc；仓库提供预编译的 amd64 二进制
+- x86-64 Linux 与 glibc；Release 提供预编译的 amd64 二进制（在 Ubuntu 22.04 runner 上原生构建）
 - 真机 GPU 模式需要正常安装的 NVIDIA 驱动和 `libnvidia-ml.so`
 - 需要硬隔离和进程降权时，daemon 应以 root 运行，并具备 cgroup v2 写权限
 - 推荐 systemd 管理 daemon
@@ -52,24 +52,50 @@ GPU Manager 是一套运行在单台机器上的 NVIDIA GPU 调度与分配服�
 
 ### 使用预编译包
 
-仓库中的 `dist/gpu-manager-linux-amd64-0.1.0.tar.gz` 包含 `gpu-daemon` 和 `gpu` 两个 Linux amd64 二进制：
+每个 tag 的产物由 CI 构建并发布到 GitHub Release 与 Gitee 镜像：`gpu-daemon`、`gpu` 与平台说明文件打成一个 tar.gz，并附 `SHA256SUMS`。
+
+最新版本（不带版本号的文件名，指向当前最新正式 release）：
 
 ```bash
-curl -fL -o gpu-manager-linux-amd64-0.1.0.tar.gz \
-  https://raw.githubusercontent.com/pandasir/nvidia_sch/master/dist/gpu-manager-linux-amd64-0.1.0.tar.gz
+curl -fL -O https://github.com/pandasir/nvidia_sch/releases/latest/download/gpu-manager-linux-amd64.tar.gz
+curl -fL -O https://github.com/pandasir/nvidia_sch/releases/latest/download/SHA256SUMS
 
-tar -xzf gpu-manager-linux-amd64-0.1.0.tar.gz
-
-cat > SHA256SUMS <<'EOF'
-61b73fffb4138f42d3cc5c36ea865d14cd45aa47f58ddeb6664d9414e78d115a  linux-amd64/gpu-daemon
-f729102b0fc954e087214093f4e4780d26e49e040a8e1000887bdefda0be6302  linux-amd64/gpu
-EOF
-
-sha256sum -c SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+tar -xzf gpu-manager-linux-amd64.tar.gz
 
 sudo install -d -m 0755 /opt/gpu-manager
 sudo install -m 0755 linux-amd64/gpu-daemon /opt/gpu-manager/gpu-daemon
 sudo install -m 0755 linux-amd64/gpu /opt/gpu-manager/gpu
+```
+
+指定版本：
+
+```bash
+VERSION=0.1.0
+
+curl -fL -O "https://github.com/pandasir/nvidia_sch/releases/download/v${VERSION}/gpu-manager-linux-amd64-${VERSION}.tar.gz"
+curl -fL -O "https://github.com/pandasir/nvidia_sch/releases/download/v${VERSION}/SHA256SUMS"
+
+sha256sum -c SHA256SUMS --ignore-missing
+tar -xzf "gpu-manager-linux-amd64-${VERSION}.tar.gz"
+
+sudo install -d -m 0755 /opt/gpu-manager
+sudo install -m 0755 linux-amd64/gpu-daemon /opt/gpu-manager/gpu-daemon
+sudo install -m 0755 linux-amd64/gpu /opt/gpu-manager/gpu
+```
+
+`SHA256SUMS` 同时列出带版本号与不带版本号的两个归档，只下载其中一个时用 `--ignore-missing` 校验已下载的那个。
+
+国内可从 Gitee 镜像下载同一份产物（Gitee 没有 `latest` 语义，按版本取）：
+
+```bash
+VERSION=0.1.0
+
+curl -fL -O "https://gitee.com/yydb/nvidia_sch/releases/download/v${VERSION}/gpu-manager-linux-amd64-${VERSION}.tar.gz"
+curl -fL -O "https://gitee.com/yydb/nvidia_sch/releases/download/v${VERSION}/SHA256SUMS"
+
+sha256sum -c SHA256SUMS --ignore-missing
+tar -xzf "gpu-manager-linux-amd64-${VERSION}.tar.gz"
 ```
 
 验证安装：
@@ -78,6 +104,8 @@ sudo install -m 0755 linux-amd64/gpu /opt/gpu-manager/gpu
 /opt/gpu-manager/gpu-daemon --version
 /opt/gpu-manager/gpu --version
 ```
+
+版本号与 tag 一致：发布 `v0.1.0` 时两个命令都输出 `0.1.0`。
 
 ### 从源码安装
 
@@ -96,6 +124,8 @@ sudo install -m 0755 \
 ```
 
 ### 在 macOS 上交叉编译 Linux amd64
+
+正式发布产物由 GitHub Actions 在 `ubuntu-22.04` 上原生构建（见 `.github/workflows/release.yml`）。需要在没有 CI 的机器上自行出二进制时，可以用下面这条链路：
 
 产物使用 glibc 动态链接，能够在主流 Linux 发行版上运行：
 
