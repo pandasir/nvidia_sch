@@ -1,0 +1,14 @@
+{
+  "version": "0.1.0",
+  "tag": "v0.1.0",
+  "prerelease": false,
+  "github": {
+    "archive": "https://github.com/pandasir/nvidia_sch/releases/download/v0.1.0/gpu-manager-linux-amd64-0.1.0.tar.gz",
+    "latest": "https://github.com/pandasir/nvidia_sch/releases/latest/download/gpu-manager-linux-amd64.tar.gz"
+  },
+  "gitee": {
+    "archive": "https://gitee.com/yydb/nvidia_sch/releases/download/v0.1.0/gpu-manager-linux-amd64-0.1.0.tar.gz",
+    "available": true
+  },
+  "sha256sums": "https://github.com/pandasir/nvidia_sch/releases/download/v0.1.0/SHA256SUMS"
+}

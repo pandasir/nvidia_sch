@@ -3,3 +3,6 @@
 .idea/
 .DS_Store
 /.tools
+node_modules/
+docs/.vitepress/cache/
+docs/.vitepress/dist/
