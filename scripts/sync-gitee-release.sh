@@ -187,8 +187,9 @@ RELEASE_ID=""
 if [ "$STATUS" = "200" ] && [ "$(json_get 'type' 2>/dev/null || echo null)" != "null" ]; then
   RELEASE_ID="$(json_get '.id')"
   log "release 已存在 (id=${RELEASE_ID})，将原地更新"
-  payload="$(jq -n --arg name "$NAME" --arg body "$BODY" --argjson pre "$PRERELEASE" \
-    '{name: $name, body: $body, prerelease: $pre}')"
+  # Gitee 的更新接口要求 tag_name 必填，缺了会返回 400 {"messages":["tag_name is missing"]}
+  payload="$(jq -n --arg tag "$TAG" --arg name "$NAME" --arg body "$BODY" --argjson pre "$PRERELEASE" \
+    '{tag_name: $tag, name: $name, body: $body, prerelease: $pre}')"
   http PATCH "${REPO_PATH}/releases/${RELEASE_ID}" \
     -H 'Content-Type: application/json' -d "$payload"
   [ "$STATUS" = "200" ] || die "更新 release 失败 (HTTP $STATUS): $(short_body)"
