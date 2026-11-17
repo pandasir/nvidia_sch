@@ -33,7 +33,8 @@ GPU Manager 是一套运行在单台机器上的 NVIDIA GPU 调度与分配服�
 
 ### Linux 生产部署
 
-- x86-64 Linux 与 glibc；Release 提供预编译的 amd64 二进制（在 Ubuntu 22.04 runner 上原生构建）
+- x86-64 Linux，glibc ≥ 2.34（Ubuntu 22.04+、Debian 12+、RHEL 9+）。更旧的发行版请从源码构建
+- Release 提供预编译的 amd64 二进制，由 CI 在 `ubuntu-22.04` 上原生构建；实测二进制引用的最高符号版本为 `GLIBC_2.34`
 - 真机 GPU 模式需要正常安装的 NVIDIA 驱动和 `libnvidia-ml.so`
 - 需要硬隔离和进程降权时，daemon 应以 root 运行，并具备 cgroup v2 写权限
 - 推荐 systemd 管理 daemon
